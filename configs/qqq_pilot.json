@@ -1,0 +1,8 @@
+{
+  "source_root": "/Volumes/Extreme SSD/ORATS/smv_strikes_csv",
+  "output_root": "outputs",
+  "underlying": "QQQ",
+  "pilot_start": "2026-06-01",
+  "pilot_end": "2026-06-30",
+  "chunk_size": 200000
+}

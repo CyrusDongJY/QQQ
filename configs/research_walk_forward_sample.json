@@ -1,0 +1,41 @@
+{
+  "data_start": "2024-01-02",
+  "data_end": "2024-03-28",
+  "training_period": {"start": "2024-01-10", "end": "2024-02-09"},
+  "validation_period": {"start": "2024-02-12", "end": "2024-03-01"},
+  "test_period": {"start": "2024-03-04", "end": "2024-03-20"},
+  "grid_search_scope": "training_only",
+  "selection_metric": "sharpe",
+  "top_n_candidates": 10,
+  "min_training_trades": 3,
+  "max_holdout_sharpe_decay": 0.5,
+  "underlying": "QQQ",
+  "entry_lag_days": 1,
+  "exit_dte_min": 1,
+  "risk_free_rate": 0.04,
+  "sortino_target_return": 0.0,
+  "margin_requirement_pct": 0.35,
+  "iv_percentile_lookback": 10,
+  "iv_percentile_min_periods": 3,
+  "costs": {
+    "commission_per_contract": 0.65,
+    "exchange_fee_per_contract": 0.02,
+    "slippage_per_contract": 0.0
+  },
+  "quote_filter": {
+    "max_relative_spread": 0.5,
+    "min_open_interest": 1,
+    "min_volume": 0,
+    "require_iv_positive": false
+  },
+  "price_modes": ["bid_ask"],
+  "return_thresholds": [-0.005, -0.01],
+  "iv_percentile_thresholds": [70],
+  "iv_change_thresholds": [0.01],
+  "hold_days": [3, 5],
+  "dte_targets": [14, 30],
+  "short_put_deltas": [-0.15, -0.25],
+  "long_call_deltas": [0.45],
+  "put_spread_width_pcts": [0.05],
+  "strategies": ["short_put", "put_spread", "long_call"]
+}

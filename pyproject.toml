@@ -1,0 +1,17 @@
+[project]
+name = "qqq-options-system"
+version = "0.1.0"
+description = "QQQ ORATS option-chain audit and pilot normalization tools"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "pandas>=2.0",
+  "pyarrow>=15.0",
+]
+
+[project.scripts]
+qqq-options = "qqq_options_system.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

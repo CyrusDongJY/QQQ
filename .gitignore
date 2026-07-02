@@ -2,20 +2,21 @@
 .DS_Store
 
 # Python
-__pycache__/
-*.py[cod]
 .venv/
 venv/
+__pycache__/
+*.py[cod]
 
-# Node
-node_modules/
+# Build artifacts
 dist/
 build/
+*.egg-info/
+
+# Local runtime artifacts
+work/
+work/pycache/
+outputs/
 
 # Environment and secrets
 .env
 .env.*
-
-# Codex scratch/output folders for this workspace
-work/
-outputs/
