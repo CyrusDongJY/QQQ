@@ -144,7 +144,28 @@ PYTHONPATH=src .venv/bin/python -m qqq_options_system run-experiment \
   --experiment-config configs/research_full_grid.json
 ```
 
-Current strategy engines cover short put, defined-risk put spread, and long call. Combo strategies and IV/RV spread hooks are reserved for the next expansion.
+Current strategy engines cover short put, defined-risk put spread, long call, risk reversal, and `defined_risk_bullish_combo`.
+
+The narrow three-leg bullish combo example uses a `-1%` return trigger, T+1 entry, approximately 45 DTE, a 21-trading-day hold, short-put delta `-0.50`, and a fixed put-wing width of 10% of spot:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m qqq_options_system run-experiment \
+  --experiment-config configs/defined_risk_bullish_combo_sample.json
+```
+
+For this strategy, the long-call budget is always executable put-spread credit (`short put bid - long put ask`). The selected call is the most expensive tradeable 45-DTE call whose ask fits that budget. Capital/max loss is put-spread width less the remaining three-leg entry credit, plus modeled round-trip costs. Entry failures such as non-positive credit or no affordable call are retained with explicit status and `failure_reason`.
+
+## Entry Signal Features
+
+`research.entry_signals` provides the fixed, non-Cartesian signal ablation layer used before T+1 entry:
+
+- `standardized_shock` divides the Day-T QQQ return by the prior 20 trading-day return volatility. The rolling denominator is shifted by one day.
+- `skew25` uses the nearest 45-DTE expiry with tradeable puts and calls, then selects same-expiry `-0.25/+0.25` delta IVs. Missing IV remains missing; `skew25_5d_change` is never forward-filled.
+- `close_location` is calculated from an external OHLC CSV/DataFrame; zero-range days remain missing.
+- Training calibration matches the baseline `return <= -1%` event rate using only gated training dates where both return and standardized shock are valid, then applies that rate to the same shock sample's lower-tail quantile. Validation/test rows cannot alter this threshold.
+- The close confirmation threshold is the frozen median among training-period standardized-plus-skew candidates.
+
+The four emitted masks are `baseline`, `standardized`, `standardized_skew_nonaccelerating`, and `standardized_skew_close_confirmation`. They are Day-T signal masks only; execution remains T+1. This feature layer does not modify the fixed `defined_risk_bullish_combo` contract parameters.
 
 ## Walk-Forward Anti-Overfit Run
 
@@ -174,6 +195,37 @@ outputs/backtest_results/walk_forward_QQQ_20070101_20241231/
 ```
 
 `walk_forward_candidates.csv` is the anti-overfit selection artifact. `period_splits.csv` from normal experiments is only diagnostic and must not be treated as train-only candidate selection.
+
+## Five-Factor VIX/VXN Regime Study
+
+Use the frozen regime specification in:
+
+[`docs/vix_regime_backtest_spec.md`](docs/vix_regime_backtest_spec.md)
+
+Pilot:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m qqq_options_system run-regime-study \
+  --regime-config configs/regime_vix_pilot.json
+```
+
+Full history after annual parquet conversion:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m qqq_options_system run-regime-study \
+  --regime-config configs/regime_vix_walk_forward.json
+```
+
+The background helper runs annual restartable conversion first, then the full regime study:
+
+```bash
+nohup zsh scripts/run_full_regime_2007_2024.zsh \
+  > outputs/logs/regime_full_2007_2024.log 2>&1 &
+```
+
+Regime outputs include `daily_regimes`, `conditional_trades`, `conditional_by_vix_regime`, `portfolio_daily`, `portfolio_metrics`, `walk_forward_regime_candidates`, and `report.md`. VIX/VXN are sourced from FRED `VIXCLS` and `VXNCLS`; ORATS VIX option rows are not used as VIX closes. The first term-structure implementation is QQQ option ATM IV30 versus IV90, not VIX futures.
+
+`conditional_by_vix_regime.csv` is a full-sample diagnostic. The anti-overfit artifact is `walk_forward_regime_candidates.csv`: it filters to non-overlapping `bid_ask` trades by default, splits on `signal_date`, ranks/selects using training metrics only, and attaches validation/test metrics for independent evaluation. `portfolio_daily` and `portfolio_metrics` declare `portfolio_scope=equity_allocation_only`; this minimal NAV simulation contains regime-dependent QQQ allocation returns, not option sleeve PnL.
 
 ### Backtest Assumptions And Safeguards
 

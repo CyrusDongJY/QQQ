@@ -77,6 +77,14 @@ NUMERIC_COLUMNS = [
 ]
 
 
+def underlying_ticker_aliases(underlying: str) -> set[str]:
+    """Return vendor ticker aliases that map to one canonical underlying."""
+    canonical = str(underlying).strip().upper()
+    # The Nasdaq-100 tracking ETF used QQQQ in the historical ORATS files
+    # through 2011-03-22, then QQQ from 2011-03-23 onward.
+    return {"QQQ", "QQQQ"} if canonical == "QQQ" else {canonical}
+
+
 @dataclass(frozen=True)
 class QuoteFilterConfig:
     """Configurable tradeability filter for normalized option quotes."""
@@ -185,7 +193,8 @@ def normalize_qqq_wide_to_long(
     if "ticker" not in frame.columns:
         raise ValueError("Input frame must include ticker column")
 
-    qqq = frame.loc[frame["ticker"].astype(str).str.upper() == underlying.upper()].copy()
+    aliases = underlying_ticker_aliases(underlying)
+    qqq = frame.loc[frame["ticker"].astype(str).str.upper().isin(aliases)].copy()
     if qqq.empty:
         return pd.DataFrame(columns=BASE_OUTPUT_COLUMNS)
 
@@ -199,7 +208,7 @@ def normalize_qqq_wide_to_long(
     common = pd.DataFrame(
         {
             "trade_date": _to_iso_dates(trade_dates),
-            "underlying": qqq["ticker"].astype(str).str.upper(),
+            "underlying": underlying.upper(),
             "expiry": _to_iso_dates(expiries),
             "dte": _compute_dte(trade_dates, expiries, yte),
             "strike": _series_or_default(qqq, "strike"),
@@ -254,8 +263,9 @@ def normalize_qqq_wide_to_long(
 
 
 def read_qqq_chunks(path: Path, underlying: str, chunk_size: int) -> Any:
+    aliases = underlying_ticker_aliases(underlying)
     for chunk in pd.read_csv(path, chunksize=chunk_size, low_memory=False):
-        yield chunk.loc[chunk["ticker"].astype(str).str.upper() == underlying.upper()].copy()
+        yield chunk.loc[chunk["ticker"].astype(str).str.upper().isin(aliases)].copy()
 
 
 def write_partitioned_parquet(

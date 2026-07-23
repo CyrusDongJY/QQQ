@@ -8,11 +8,24 @@ from typing import Iterable
 import pandas as pd
 
 from qqq_options_system.backtest.execution import ExecutionCostConfig, fill_price
-from qqq_options_system.backtest.selection import select_by_delta_dte, select_put_wing_by_width
+from qqq_options_system.backtest.selection import (
+    select_by_delta_dte,
+    select_call_within_premium_budget,
+    select_put_wing_by_width,
+)
 from qqq_options_system.data.normalize import QuoteFilterConfig
 
 
 MULTIPLIER = 100.0
+
+
+class EntrySelectionError(ValueError):
+    """Auditable entry failure for a signal that cannot form all required legs."""
+
+    def __init__(self, status: str, reason: str):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -23,7 +36,9 @@ class StrategySpec:
     price_mode: str
     short_put_delta: float | None = None
     long_call_delta: float | None = None
+    long_put_delta: float | None = None
     put_spread_width_pct: float | None = None
+    call_dte_target: int | None = None
     exit_dte_min: int = 1
 
     @property
@@ -33,8 +48,12 @@ class StrategySpec:
             parts.append(f"spd{self.short_put_delta:g}")
         if self.long_call_delta is not None:
             parts.append(f"lcd{self.long_call_delta:g}")
+        if self.long_put_delta is not None:
+            parts.append(f"lpd{self.long_put_delta:g}")
         if self.put_spread_width_pct is not None:
             parts.append(f"wing{self.put_spread_width_pct:g}")
+        if self.call_dte_target is not None:
+            parts.append(f"cdte{self.call_dte_target:g}")
         return "_".join(parts).replace("-", "m").replace(".", "p")
 
 
@@ -106,7 +125,7 @@ def _exit_fill(row: pd.Series, qty: int, price_mode: str) -> float:
 
 
 def _capital_required(strategy: str, legs: list[dict], config: BacktestConfig) -> float:
-    if strategy == "long_call":
+    if strategy in {"long_call", "long_put", "long_put_spread"}:
         return sum(max(0.0, leg["entry_cash_flow"] * -1.0) for leg in legs)
     if strategy == "short_put":
         short = legs[0]
@@ -117,6 +136,25 @@ def _capital_required(strategy: str, legs: list[dict], config: BacktestConfig) -
         width = float(short["entry_strike"]) - float(long["entry_strike"])
         credit = sum(leg["entry_cash_flow"] for leg in legs)
         return max(0.0, width * MULTIPLIER - credit)
+    if strategy == "defined_risk_bullish_combo":
+        short = next(leg for leg in legs if leg["right"] == "P" and leg["qty"] < 0)
+        long_put = next(leg for leg in legs if leg["right"] == "P" and leg["qty"] > 0)
+        width = float(short["entry_strike"]) - float(long_put["entry_strike"])
+        residual_credit = sum(leg["entry_cash_flow"] for leg in legs)
+        round_trip_costs = sum(float(leg["leg_cost"]) for leg in legs)
+        # The call consumes put-spread credit but adds no loss when QQQ finishes
+        # below both put strikes. Defined risk is therefore spread width less
+        # the remaining three-leg credit, including modeled round-trip costs.
+        return max(0.0, width * MULTIPLIER - residual_credit + round_trip_costs)
+    if strategy == "risk_reversal":
+        # Short put drives the margin; the long call is financed by the put
+        # premium (net credit >= 0 by construction) and adds no margin. Any
+        # residual net debit (call cost above the credit) is added on top.
+        short = next(leg for leg in legs if leg["qty"] < 0)
+        put_margin = float(short["entry_strike"]) * MULTIPLIER * float(config.margin_requirement_pct)
+        net_cash_flow = sum(leg["entry_cash_flow"] for leg in legs)
+        residual_debit = max(0.0, -net_cash_flow)
+        return put_margin + residual_debit
     return sum(abs(leg["entry_cash_flow"]) for leg in legs)
 
 
@@ -145,6 +183,36 @@ def _build_legs(
             quote_filter_config=config.quote_filter_config,
         )
         return [] if call is None else [(call, 1)]
+    if spec.strategy == "long_put":
+        put = select_by_delta_dte(
+            entry_chain,
+            "P",
+            float(spec.long_put_delta),
+            spec.dte_target,
+            spec.exit_dte_min,
+            quote_filter_config=config.quote_filter_config,
+        )
+        return [] if put is None else [(put, 1)]
+    if spec.strategy == "long_put_spread":
+        long_put = select_by_delta_dte(
+            entry_chain,
+            "P",
+            float(spec.long_put_delta),
+            spec.dte_target,
+            spec.exit_dte_min,
+            quote_filter_config=config.quote_filter_config,
+        )
+        if long_put is None:
+            return []
+        wing = select_put_wing_by_width(
+            entry_chain,
+            long_put,
+            float(spec.put_spread_width_pct),
+            quote_filter_config=config.quote_filter_config,
+        )
+        if wing is None:
+            return []
+        return [(long_put, 1), (wing, -1)]
     if spec.strategy == "put_spread":
         short_put = select_by_delta_dte(
             entry_chain,
@@ -165,6 +233,93 @@ def _build_legs(
         if wing is None:
             return []
         return [(short_put, -1), (wing, 1)]
+    if spec.strategy == "risk_reversal":
+        short_put = select_by_delta_dte(
+            entry_chain,
+            "P",
+            float(spec.short_put_delta),
+            spec.dte_target,
+            spec.exit_dte_min,
+            quote_filter_config=config.quote_filter_config,
+        )
+        if short_put is None:
+            return []
+        # Premium collected from selling the put funds the long call. Budget is
+        # the per-share credit at the configured price mode.
+        put_credit = _entry_fill(short_put, -1, spec.price_mode)
+        call_dte = int(spec.call_dte_target if spec.call_dte_target is not None else spec.dte_target)
+        entry_cost_column = "mid" if spec.price_mode == "midpoint" else "ask"
+        call = select_call_within_premium_budget(
+            entry_chain,
+            call_dte_target=call_dte,
+            premium_budget=put_credit,
+            entry_cost_column=entry_cost_column,
+            min_dte=spec.exit_dte_min,
+            required_expiry=str(short_put["expiry"]),
+            quote_filter_config=config.quote_filter_config,
+        )
+        if call is None:
+            return []
+        return [(short_put, -1), (call, 1)]
+    if spec.strategy == "defined_risk_bullish_combo":
+        if spec.price_mode != "bid_ask":
+            raise EntrySelectionError(
+                "failed_unsupported_execution",
+                "defined_risk_bullish_combo requires bid_ask execution",
+            )
+        short_put = select_by_delta_dte(
+            entry_chain,
+            "P",
+            float(spec.short_put_delta),
+            spec.dte_target,
+            spec.exit_dte_min,
+            quote_filter_config=config.quote_filter_config,
+        )
+        if short_put is None:
+            raise EntrySelectionError(
+                "failed_no_short_put",
+                "No tradeable short put matched the target delta/DTE",
+            )
+        long_put = select_put_wing_by_width(
+            entry_chain,
+            short_put,
+            float(spec.put_spread_width_pct),
+            quote_filter_config=config.quote_filter_config,
+        )
+        if long_put is None:
+            raise EntrySelectionError(
+                "failed_no_put_wing",
+                "No tradeable lower-strike put wing matched the configured width",
+            )
+        try:
+            spread_credit = _entry_fill(short_put, -1, "bid_ask") - _entry_fill(
+                long_put, 1, "bid_ask"
+            )
+        except ValueError as exc:
+            raise EntrySelectionError("failed_invalid_entry_quote", str(exc)) from exc
+        if spread_credit <= 0:
+            raise EntrySelectionError(
+                "failed_nonpositive_put_spread_credit",
+                f"Executable put-spread credit must be positive, got {spread_credit:g}",
+            )
+        call_dte = int(
+            spec.call_dte_target if spec.call_dte_target is not None else spec.dte_target
+        )
+        call = select_call_within_premium_budget(
+            entry_chain,
+            call_dte_target=call_dte,
+            premium_budget=spread_credit,
+            entry_cost_column="ask",
+            min_dte=spec.exit_dte_min,
+            required_expiry=str(short_put["expiry"]),
+            quote_filter_config=config.quote_filter_config,
+        )
+        if call is None:
+            raise EntrySelectionError(
+                "failed_no_affordable_call",
+                f"No tradeable call ask fits executable put-spread credit {spread_credit:g}",
+            )
+        return [(short_put, -1), (long_put, 1), (call, 1)]
     raise ValueError(f"Unsupported strategy: {spec.strategy}")
 
 
@@ -175,9 +330,15 @@ def _choose_exit_index(
     hold_days: int,
     exit_dte_min: int,
 ) -> int | None:
-    scheduled = min(entry_index + hold_days, len(dates) - 1)
-    latest_allowed = None
+    scheduled = entry_index + hold_days
+    last_date = pd.Timestamp(dates[-1])
     expiry_ts = pd.Timestamp(expiry)
+    # Do not turn a right-censored trade into an artificial early exit at the
+    # dataset boundary. An earlier exit remains valid when expiry forces it.
+    if scheduled >= len(dates) and (expiry_ts - last_date).days >= exit_dte_min:
+        return None
+    scheduled = min(scheduled, len(dates) - 1)
+    latest_allowed = None
     for index in range(entry_index + 1, len(dates)):
         dte = (expiry_ts - pd.Timestamp(dates[index])).days
         if dte >= exit_dte_min:
@@ -195,9 +356,10 @@ def run_strategy(
     spec: StrategySpec,
     entry_lag_days: int = 1,
     config: BacktestConfig | None = None,
+    calendar_dates: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     cfg = config or BacktestConfig()
-    dates = sorted(chains)
+    dates = sorted(set(str(value) for value in calendar_dates)) if calendar_dates is not None else sorted(chains)
     date_to_index = {date: index for index, date in enumerate(dates)}
     rows: list[dict] = []
     for signal_date in signal_dates:
@@ -208,9 +370,53 @@ def run_strategy(
         if entry_index >= len(dates):
             continue
         entry_date = dates[entry_index]
-        entry_chain = chains[entry_date]
-        legs = _build_legs(entry_chain, spec, cfg)
+        entry_chain = chains.get(entry_date)
+        if entry_chain is None:
+            rows.append(
+                _trade_row(
+                    spec=spec,
+                    signal_date=signal_date,
+                    entry_date=entry_date,
+                    exit_date="",
+                    entry_lag_days=entry_lag_days,
+                    status="failed_missing_entry_chain",
+                    failure_reason="No option-chain partition on the scheduled market-calendar entry date",
+                    config=cfg,
+                )
+            )
+            continue
+        try:
+            legs = _build_legs(entry_chain, spec, cfg)
+        except EntrySelectionError as exc:
+            rows.append(
+                _trade_row(
+                    spec=spec,
+                    signal_date=signal_date,
+                    entry_date=entry_date,
+                    exit_date="",
+                    entry_lag_days=entry_lag_days,
+                    status=exc.status,
+                    failure_reason=exc.reason,
+                    config=cfg,
+                )
+            )
+            continue
         if not legs:
+            rows.append(
+                _trade_row(
+                    spec=spec,
+                    signal_date=signal_date,
+                    entry_date=entry_date,
+                    exit_date="",
+                    entry_lag_days=entry_lag_days,
+                    status="failed_no_entry_selection",
+                    failure_reason=(
+                        "No complete set of tradeable option legs matched the configured "
+                        "delta, DTE, quote-quality, and premium-budget rules"
+                    ),
+                    config=cfg,
+                )
+            )
             continue
         earliest_expiry = min(str(row["expiry"]) for row, _ in legs)
         exit_index = _choose_exit_index(
@@ -231,7 +437,21 @@ def run_strategy(
             )
             continue
         exit_date = dates[exit_index]
-        exit_chain = chains[exit_date]
+        exit_chain = chains.get(exit_date)
+        if exit_chain is None:
+            rows.append(
+                _trade_row(
+                    spec=spec,
+                    signal_date=signal_date,
+                    entry_date=entry_date,
+                    exit_date=exit_date,
+                    entry_lag_days=entry_lag_days,
+                    status="failed_missing_exit_chain",
+                    failure_reason="No option-chain partition on the scheduled market-calendar exit date",
+                    config=cfg,
+                )
+            )
+            continue
         leg_records: list[dict] = []
         gross_pnl = 0.0
         failed_reason = ""
@@ -296,6 +516,7 @@ def run_strategy(
         total_costs = sum(leg["leg_cost"] for leg in leg_records)
         pnl = gross_pnl - total_costs
         capital = _capital_required(spec.strategy, leg_records, cfg)
+        max_loss = capital
         rows.append(
             _trade_row(
                 spec=spec,
@@ -308,6 +529,7 @@ def run_strategy(
                 config=cfg,
                 leg_records=leg_records,
                 capital_required=capital,
+                max_loss=max_loss,
                 gross_pnl=gross_pnl,
                 total_costs=total_costs,
                 pnl=pnl,
@@ -327,6 +549,7 @@ def _trade_row(
     config: BacktestConfig,
     leg_records: list[dict] | None = None,
     capital_required: float = 0.0,
+    max_loss: float = 0.0,
     gross_pnl: float = 0.0,
     total_costs: float = 0.0,
     pnl: float = 0.0,
@@ -344,10 +567,16 @@ def _trade_row(
         "price_mode": spec.price_mode,
         "short_put_delta": spec.short_put_delta,
         "long_call_delta": spec.long_call_delta,
+        "long_put_delta": spec.long_put_delta,
         "put_spread_width_pct": spec.put_spread_width_pct,
+        "call_dte_target": spec.call_dte_target,
         "status": status,
         "failure_reason": failure_reason,
-        "capital_model": config.capital_model,
+        "capital_model": (
+            "defined_risk_width_minus_residual_credit_plus_round_trip_costs"
+            if spec.strategy == "defined_risk_bullish_combo"
+            else config.capital_model
+        ),
         "commission_per_contract": config.cost_config.commission_per_contract,
         "exchange_fee_per_contract": config.cost_config.exchange_fee_per_contract,
         "slippage_per_contract": config.cost_config.slippage_per_contract,
@@ -355,8 +584,12 @@ def _trade_row(
         "legs": len(legs),
         "leg_details": repr(legs),
         "capital_required": capital_required,
+        "max_loss": max_loss,
         "gross_pnl": gross_pnl,
         "total_costs": total_costs,
+        "net_pnl": pnl,
         "pnl": pnl,
         "return_on_capital": pnl / capital_required if capital_required else 0.0,
+        "return_on_risk": pnl / max_loss if max_loss else 0.0,
+        "pnl_per_1000_risk": pnl / max_loss * 1000.0 if max_loss else 0.0,
     }

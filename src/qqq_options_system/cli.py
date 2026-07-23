@@ -11,6 +11,7 @@ from qqq_options_system.data.audit import audit_qqq_file, write_daily_audit_csv
 from qqq_options_system.data.normalize import normalize_qqq_wide_to_long, write_partitioned_parquet
 from qqq_options_system.data.orats_files import discover_files, write_inventory_csv
 from qqq_options_system.research.experiments import load_experiment_config, run_experiment
+from qqq_options_system.research.regime_experiment import load_regime_config, run_regime_study
 from qqq_options_system.research.walk_forward import run_walk_forward_experiment
 
 
@@ -171,6 +172,20 @@ def cmd_run_walk_forward(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_regime_study(args: argparse.Namespace) -> int:
+    settings = resolve_settings(args)
+    config = load_regime_config(args.regime_config)
+    if args.data_start:
+        config["data_start"] = args.data_start
+    if args.data_end:
+        config["data_end"] = args.data_end
+    config["underlying"] = settings["underlying"]
+    paths = run_regime_study(config, settings["output_root"])
+    for name, path in paths.items():
+        print(f"{name}: {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qqq-options")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -229,6 +244,20 @@ def build_parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--data-end")
     walk_forward.add_argument("--entry-lag-days", type=int)
     walk_forward.set_defaults(func=cmd_run_walk_forward)
+
+    regime = subparsers.add_parser(
+        "run-regime-study",
+        help="Run five-factor VIX/VXN regime cohort study",
+    )
+    add_common_args(regime)
+    regime.add_argument(
+        "--regime-config",
+        type=Path,
+        default=Path("configs/regime_vix_pilot.json"),
+    )
+    regime.add_argument("--data-start")
+    regime.add_argument("--data-end")
+    regime.set_defaults(func=cmd_run_regime_study)
 
     return parser
 

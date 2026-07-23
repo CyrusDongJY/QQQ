@@ -64,6 +64,36 @@ def iter_strategy_specs(config: dict[str, Any]):
                             long_call_delta=float(delta),
                             exit_dte_min=exit_dte_min,
                         )
+                if "risk_reversal" in config.get("strategies", []):
+                    for put_delta in config.get("risk_reversal_put_deltas", [-0.50]):
+                        for call_dte in config.get("call_dte_targets", [int(dte)]):
+                            yield StrategySpec(
+                                strategy="risk_reversal",
+                                dte_target=int(dte),
+                                hold_days=int(hold),
+                                price_mode=price_mode,
+                                short_put_delta=float(put_delta),
+                                call_dte_target=int(call_dte),
+                                exit_dte_min=exit_dte_min,
+                            )
+                if "defined_risk_bullish_combo" in config.get("strategies", []):
+                    combo_deltas = config.get(
+                        "defined_risk_bullish_combo_put_deltas",
+                        config.get("short_put_deltas", [-0.50]),
+                    )
+                    for put_delta in combo_deltas:
+                        for width in config.get("put_spread_width_pcts", [0.05, 0.10]):
+                            for call_dte in config.get("call_dte_targets", [int(dte)]):
+                                yield StrategySpec(
+                                    strategy="defined_risk_bullish_combo",
+                                    dte_target=int(dte),
+                                    hold_days=int(hold),
+                                    price_mode=price_mode,
+                                    short_put_delta=float(put_delta),
+                                    put_spread_width_pct=float(width),
+                                    call_dte_target=int(call_dte),
+                                    exit_dte_min=exit_dte_min,
+                                )
 
 
 def iter_triggers(config: dict[str, Any]):
@@ -137,6 +167,7 @@ def run_experiment(config: dict[str, Any], output_root: Path) -> dict[str, Path]
                     "short_put_delta": spec.short_put_delta,
                     "long_call_delta": spec.long_call_delta,
                     "put_spread_width_pct": spec.put_spread_width_pct,
+                    "call_dte_target": spec.call_dte_target,
                     "entry_lag_days": entry_lag_days,
                     "capital_model": backtest_config.capital_model,
                 }
@@ -283,6 +314,7 @@ def write_markdown_report(
             "short_put_delta",
             "long_call_delta",
             "put_spread_width_pct",
+            "call_dte_target",
             "trades",
             "closed_trades",
             "failed_trades",

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from qqq_options_system.data.normalize import underlying_ticker_aliases
 from qqq_options_system.data.orats_files import OratsFile
 from qqq_options_system.market.contracts import parse_orats_date
 
@@ -35,6 +36,7 @@ def audit_qqq_file(
     max_strike: float | None = None
     trade_date_mismatches = 0
     expected_trade_date = item.file_date.isoformat()
+    aliases = underlying_ticker_aliases(underlying)
 
     usecols = [
         col
@@ -42,7 +44,7 @@ def audit_qqq_file(
         if col in item.header
     ]
     for chunk in pd.read_csv(item.path, usecols=usecols, chunksize=chunk_size, low_memory=False):
-        qqq = chunk.loc[chunk["ticker"].astype(str).str.upper() == underlying.upper()]
+        qqq = chunk.loc[chunk["ticker"].astype(str).str.upper().isin(aliases)]
         if qqq.empty:
             continue
         total_rows += len(qqq)

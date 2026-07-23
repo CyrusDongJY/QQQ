@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+import warnings
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -75,7 +76,15 @@ def discover_files(
             continue
         if end is not None and file_date > end:
             continue
-        header = read_header(path)
+        try:
+            header = read_header(path)
+        except (UnicodeDecodeError, StopIteration, csv.Error) as exc:
+            warnings.warn(
+                f"Skipping unreadable ORATS CSV {path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
         row_count = count_data_rows(path) if include_row_counts else None
         files.append(
             OratsFile(

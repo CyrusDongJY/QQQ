@@ -10,6 +10,29 @@ from qqq_options_system.data.normalize import (
 
 
 class NormalizeTests(unittest.TestCase):
+    def test_historical_qqqq_alias_normalizes_to_qqq(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "ticker": "QQQQ",
+                    "stkPx": "43.24",
+                    "expirDate": "1/20/2007",
+                    "strike": "43.00",
+                    "cBidPx": "1.00",
+                    "cValue": "1.10",
+                    "cAskPx": "1.20",
+                    "pBidPx": "0.90",
+                    "pValue": "1.00",
+                    "pAskPx": "1.10",
+                    "trade_date": "1/3/2007",
+                }
+            ]
+        )
+        out = normalize_qqq_wide_to_long(frame, "old.csv", "oldschema")
+        self.assertEqual(len(out), 2)
+        self.assertEqual(set(out["underlying"]), {"QQQ"})
+        self.assertTrue(out["contract_id"].str.startswith("QQQ_20070120_").all())
+
     def test_wide_call_put_rows_become_long_rows(self):
         frame = pd.DataFrame(
             [

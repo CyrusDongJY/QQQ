@@ -100,6 +100,7 @@ def run_walk_forward_experiment(config: dict[str, Any], output_root: Path) -> di
                 "short_put_delta": spec.short_put_delta,
                 "long_call_delta": spec.long_call_delta,
                 "put_spread_width_pct": spec.put_spread_width_pct,
+                "call_dte_target": spec.call_dte_target,
                 "entry_lag_days": entry_lag_days,
                 "capital_model": backtest_config.capital_model,
             }
@@ -248,6 +249,7 @@ def write_walk_forward_report(
         "short_put_delta",
         "long_call_delta",
         "put_spread_width_pct",
+        "call_dte_target",
         "training_closed_trades",
         "training_sharpe",
         "validation_sharpe",

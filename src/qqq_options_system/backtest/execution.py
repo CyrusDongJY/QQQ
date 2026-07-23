@@ -40,7 +40,7 @@ def fill_price(bid: float, mid: float, ask: float, side: str, price_mode: str = 
     ask = _validate_quote_number("ask", ask)
     if ask < bid:
         raise ValueError(f"Invalid quote with ask < bid: bid={bid}, ask={ask}")
-    if mid <= 0:
+    if price_mode == "midpoint" and mid <= 0:
         raise ValueError(f"Invalid quote: mid must be positive, got {mid}")
     side_text = side.lower()
     if side_text not in {"buy", "sell"}:

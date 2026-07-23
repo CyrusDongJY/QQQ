@@ -1,0 +1,37 @@
+{
+  "data_start": "2024-01-02",
+  "data_end": "2024-03-28",
+  "research_start": "2024-01-10",
+  "research_end": "2024-03-20",
+  "underlying": "QQQ",
+  "entry_lag_days": 1,
+  "exit_dte_min": 1,
+  "risk_free_rate": 0.04,
+  "sortino_target_return": 0.0,
+  "margin_requirement_pct": 1.0,
+  "iv_percentile_lookback": 252,
+  "iv_percentile_min_periods": 60,
+  "costs": {
+    "commission_per_contract": 0.65,
+    "exchange_fee_per_contract": 0.02,
+    "slippage_per_contract": 0.0
+  },
+  "quote_filter": {
+    "max_relative_spread": 0.5,
+    "min_open_interest": 1,
+    "min_volume": 0,
+    "require_iv_positive": false
+  },
+  "price_modes": ["bid_ask"],
+  "return_thresholds": [-0.01, -0.02],
+  "iv_percentile_thresholds": [],
+  "iv_change_thresholds": [],
+  "hold_days": [5, 10, 21],
+  "dte_targets": [45],
+  "short_put_deltas": [-0.50],
+  "risk_reversal_put_deltas": [-0.50],
+  "call_dte_targets": [45, 60],
+  "long_call_deltas": [],
+  "put_spread_width_pcts": [],
+  "strategies": ["risk_reversal"]
+}
