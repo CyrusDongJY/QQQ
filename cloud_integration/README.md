@@ -41,7 +41,9 @@ Pass an explicit deployment path to update another vendored copy:
   therefore has five sessions through settlement, matching the frozen study.
 
 QQQ OHLC uses unadjusted Yahoo prices (`auto_adjust=False`) to match the frozen
-price-action definition. Small ex-dividend moves can affect raw close returns.
+price-action definition. The email prints the full completed daily OHLC, gap
+return, intraday high/low returns and close return. Small ex-dividend moves can
+affect raw close returns.
 
 ## Executable contract candidates
 
@@ -67,7 +69,10 @@ non-executable. The optional cloud setting
 
 The 15:35 ET scan is a candidate snapshot, not a locked EOD fill and never
 creates an IBKR order. The email instructs the operator to recheck Delta,
-bid/ask and liquidity near the close.
+bid/ask and liquidity near the close. Because the current session is unfinished
+at 15:35 ET, its bar is deliberately excluded: the signal date shown in the
+email is the prior completed session, and the current day is its T+1 candidate
+entry day.
 
 ## Verification
 

@@ -642,10 +642,11 @@ class UnifiedLedgerBuilder:
                 interval='1d',
                 auto_adjust=False,
             )
-        if history.empty or not {'High', 'Close'}.issubset(history.columns):
-            raise RuntimeError("yfinance没有返回QQQ High/Close日线")
+        required_columns = {'Open', 'High', 'Low', 'Close'}
+        if history.empty or not required_columns.issubset(history.columns):
+            raise RuntimeError("yfinance没有返回QQQ完整OHLC日线")
 
-        bars = history[['High', 'Close']].copy()
+        bars = history[['Open', 'High', 'Low', 'Close']].copy()
         bars.index = [
             index.date() if hasattr(index, 'date') else index for index in bars.index
         ]
@@ -662,7 +663,7 @@ class UnifiedLedgerBuilder:
             publication_cutoff is None or now < publication_cutoff
         ):
             bars = bars.drop(index=now.date())
-        bars = bars.dropna(subset=['High', 'Close'])
+        bars = bars.dropna(subset=['Open', 'High', 'Low', 'Close'])
         if len(bars) < 2:
             raise RuntimeError("QQQ已完成日线不足两天，无法计算信号")
         return bars.tail(2)
@@ -929,7 +930,9 @@ class UnifiedLedgerBuilder:
                 signal_date=signal_date,
                 entry_date=entry_date,
                 prior_close=float(previous_bar['Close']),
+                open=float(signal_bar['Open']),
                 high=float(signal_bar['High']),
+                low=float(signal_bar['Low']),
                 close=float(signal_bar['Close']),
                 put_wall=self._finite_float(wall_row.get('monthly_put_wall')),
                 call_wall=self._finite_float(wall_row.get('monthly_call_wall')),

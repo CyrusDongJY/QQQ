@@ -13,7 +13,9 @@ def context(**overrides):
         "signal_date": date(2026, 7, 20),
         "entry_date": date(2026, 7, 21),
         "prior_close": 600.0,
+        "open": 600.0,
         "high": 601.0,
+        "low": 599.0,
         "close": 600.0,
         "put_wall": 580.0,
         "call_wall": 620.0,
@@ -24,6 +26,14 @@ def context(**overrides):
         "five_factor_regime": "normalized",
     }
     values.update(overrides)
+    if "low" not in overrides:
+        values["low"] = min(
+            values["low"], values["open"], values["high"], values["close"]
+        )
+    if "high" not in overrides:
+        values["high"] = max(
+            values["high"], values["open"], values["low"], values["close"]
+        )
     return QQQSignalContext(**values)
 
 
@@ -52,6 +62,37 @@ class LiveQQQStrategyEmailTests(unittest.TestCase):
             context(close=594.0, five_factor_regime="high_rising")
         )[1]
         self.assertEqual(blocked.status, "BLOCKED")
+
+    def test_gap_down_daily_low_and_close_are_visible_without_changing_rule(self):
+        ctx = context(
+            signal_date=date(2026, 7, 23),
+            entry_date=date(2026, 7, 24),
+            prior_close=705.35,
+            open=694.67,
+            high=698.66,
+            low=687.79,
+            close=691.96,
+            five_factor_regime="normalized",
+        )
+        signal = evaluate_qqq_signals(ctx)[1]
+        self.assertEqual(signal.status, "TRIGGERED")
+        self.assertAlmostEqual(ctx.gap_open_return, 694.67 / 705.35 - 1.0)
+        self.assertAlmostEqual(ctx.intraday_low_return, 687.79 / 705.35 - 1.0)
+        evidence = " ".join(signal.evidence)
+        self.assertIn("盘中最低跌幅 -2.49%", evidence)
+        self.assertIn("收盘涨跌幅 -1.90%", evidence)
+
+        text = format_signal_email_section(ctx, evaluate_qqq_signals(ctx))
+        self.assertIn("开盘 $694.67", text)
+        self.assertIn("最低 $687.79", text)
+        self.assertIn("仅使用已完成日线", text)
+
+    def test_intraday_low_alone_does_not_change_frozen_close_trigger(self):
+        signal = evaluate_qqq_signals(
+            context(open=594.0, high=601.0, low=585.0, close=598.0)
+        )[1]
+        self.assertLessEqual(585.0 / 600.0 - 1.0, -0.02)
+        self.assertEqual(signal.status, "NO_SIGNAL")
 
     def test_downtrend_without_regime_is_watch_not_unqualified_trade(self):
         signal = evaluate_qqq_signals(

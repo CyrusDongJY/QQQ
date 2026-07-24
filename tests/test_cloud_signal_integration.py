@@ -120,7 +120,12 @@ class CloudSignalIntegrationTests(unittest.TestCase):
             },
         )
         history = pd.DataFrame(
-            {"High": [505.0, 507.0, 510.0], "Close": [503.0, 506.0, 509.0]},
+            {
+                "Open": [501.0, 504.0, 508.0],
+                "High": [505.0, 507.0, 510.0],
+                "Low": [500.0, 503.0, 507.0],
+                "Close": [503.0, 506.0, 509.0],
+            },
             index=pd.to_datetime(["2024-11-26", "2024-11-27", "2024-11-29"]),
         )
         after_publication = self.module.NY_TZ.localize(
@@ -132,6 +137,7 @@ class CloudSignalIntegrationTests(unittest.TestCase):
             calendar=calendar,
         )
         self.assertEqual(bars.index[-1], half_day)
+        self.assertEqual(list(bars.columns), ["Open", "High", "Low", "Close"])
 
         before_publication = self.module.NY_TZ.localize(
             datetime.datetime(2024, 11, 29, 13, 5)

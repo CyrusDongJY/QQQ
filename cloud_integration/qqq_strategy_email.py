@@ -35,6 +35,8 @@ class QQQSignalContext:
     prior_close: float
     high: float
     close: float
+    open: Optional[float] = None
+    low: Optional[float] = None
     put_wall: Optional[float] = None
     call_wall: Optional[float] = None
     wall_expiry: Optional[date] = None
@@ -53,6 +55,18 @@ class QQQSignalContext:
     @property
     def intraday_high_return(self) -> float:
         return self.high / self.prior_close - 1.0
+
+    @property
+    def gap_open_return(self) -> Optional[float]:
+        if self.open is None:
+            return None
+        return self.open / self.prior_close - 1.0
+
+    @property
+    def intraday_low_return(self) -> Optional[float]:
+        if self.low is None:
+            return None
+        return self.low / self.prior_close - 1.0
 
 
 @dataclass(frozen=True)
@@ -155,6 +169,12 @@ def _evaluate_downtrend(context: QQQSignalContext) -> StrategySignal:
         exit_rule="持有21个交易日，exit_dte_min=1",
         risk_rule="最大下行风险 = Put Spread 宽度 - 三腿剩余净信用 + 逐腿双边费用",
         evidence=(
+            f"跳空开盘 {context.gap_open_return:+.2%}"
+            if context.gap_open_return is not None
+            else "跳空开盘 缺失",
+            f"盘中最低跌幅 {context.intraday_low_return:+.2%}"
+            if context.intraday_low_return is not None
+            else "盘中最低跌幅 缺失",
             f"收盘涨跌幅 {context.close_return:+.2%}",
             f"五因子状态 {context.five_factor_regime or '缺失'}",
         ),
@@ -277,6 +297,22 @@ def evaluate_qqq_signals(context: QQQSignalContext) -> Tuple[StrategySignal, ...
         for value in (context.prior_close, context.high, context.close)
     ):
         raise ValueError("QQQ signal context requires finite positive OHLC values")
+    optional_prices = {
+        "open": context.open,
+        "low": context.low,
+    }
+    if any(
+        value is not None
+        and (not math.isfinite(float(value)) or float(value) <= 0)
+        for value in optional_prices.values()
+    ):
+        raise ValueError("QQQ signal context requires finite positive optional OHLC values")
+    if context.low is not None:
+        observed_prices = [context.high, context.close]
+        if context.open is not None:
+            observed_prices.append(context.open)
+        if context.low > min(observed_prices) or context.high < max(observed_prices):
+            raise ValueError("QQQ signal context has inconsistent daily OHLC bounds")
     signals = (
         _evaluate_uptrend(context),
         _evaluate_downtrend(context),
@@ -309,8 +345,27 @@ def format_signal_email_section(
     lines = [
         "",
         "[QQQ 冻结策略信号监控]",
-        f"信号日: {context.signal_date.isoformat()} | 前收 ${context.prior_close:.2f} | 最高 ${context.high:.2f} | 收盘 ${context.close:.2f}",
-        f"盘中最高涨幅: {context.intraday_high_return:+.2%} | 收盘涨跌幅: {context.close_return:+.2%}",
+        (
+            f"信号日: {context.signal_date.isoformat()} | 前收 ${context.prior_close:.2f}"
+            f" | 开盘 ${context.open:.2f}" if context.open is not None else
+            f"信号日: {context.signal_date.isoformat()} | 前收 ${context.prior_close:.2f} | 开盘 缺失"
+        )
+        + f" | 最高 ${context.high:.2f}"
+        + (f" | 最低 ${context.low:.2f}" if context.low is not None else " | 最低 缺失")
+        + f" | 收盘 ${context.close:.2f}",
+        (
+            f"跳空开盘: {context.gap_open_return:+.2%}"
+            if context.gap_open_return is not None
+            else "跳空开盘: 缺失"
+        )
+        + f" | 盘中最高涨幅: {context.intraday_high_return:+.2%}"
+        + (
+            f" | 盘中最低跌幅: {context.intraday_low_return:+.2%}"
+            if context.intraday_low_return is not None
+            else " | 盘中最低跌幅: 缺失"
+        )
+        + f" | 收盘涨跌幅: {context.close_return:+.2%}",
+        "数据口径: 仅使用已完成日线；未收盘的当前交易日不会进入本次判断。",
     ]
     if context.iv_rank is not None or context.skew_25d is not None:
         lines.append(
