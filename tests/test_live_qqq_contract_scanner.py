@@ -7,6 +7,7 @@ from qqq_options_system.live.qqq_contract_scanner import (
     build_downtrend_combo_candidate,
     build_uptrend_funded_call_candidate,
     build_wall_debit_spread_candidate,
+    failed_contract_scan_result,
     format_contract_scan_section,
 )
 
@@ -126,6 +127,34 @@ class LiveQQQContractScannerTests(unittest.TestCase):
         self.assertIn("组合净信用", text)
         self.assertIn("估算最大损失", text)
         self.assertIn("不创建或发送订单", text)
+
+    def test_blocked_signal_still_lists_research_candidate_with_no_trade_limit(self):
+        result = build_downtrend_combo_candidate(
+            [
+                quote("P", 100, 8.0, 8.2, -0.50),
+                quote("P", 90, 1.8, 2.0, -0.15),
+            ],
+            [quote("C", 101, 5.7, 5.9, 0.48)],
+            100.0,
+            QUOTE_TIME,
+            signal_status="BLOCKED",
+        )
+        text = format_contract_scan_section([result])
+        self.assertIn("[BLOCKED]", text)
+        self.assertIn("具体合约", text)
+        self.assertIn("状态gate明确禁止下单", text)
+
+    def test_broker_failure_is_a_structured_email_result(self):
+        result = failed_contract_scan_result(
+            "downtrend_defined_risk_combo",
+            "下跌走势",
+            "WATCH",
+            QUOTE_TIME,
+            "IBKR未连接",
+        )
+        text = format_contract_scan_section([result])
+        self.assertIn("QQQ 缺失", text)
+        self.assertIn("FAILED - IBKR未连接", text)
 
 
 if __name__ == "__main__":

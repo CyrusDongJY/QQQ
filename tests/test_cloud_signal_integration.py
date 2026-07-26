@@ -209,7 +209,7 @@ class CloudSignalIntegrationTests(unittest.TestCase):
             datetime.date(2024, 6, 12),
         )
 
-    def test_signal_scan_runs_before_broker_connection_failure(self):
+    def test_broker_connection_failure_still_emits_contract_scan_result(self):
         builder = self.module.UnifiedLedgerBuilder.__new__(
             self.module.UnifiedLedgerBuilder
         )
@@ -233,8 +233,7 @@ class CloudSignalIntegrationTests(unittest.TestCase):
 
         builder.run()
 
-        self.assertEqual(calls[:2], ["scan", "connect"])
-        self.assertNotIn("scan_contracts", calls)
+        self.assertEqual(calls[:3], ["scan", "connect", "scan_contracts"])
         self.assertIn("send_report", calls)
 
     def test_contract_candidates_scan_only_after_broker_connects(self):
@@ -278,6 +277,82 @@ class CloudSignalIntegrationTests(unittest.TestCase):
             today=datetime.date(2026, 7, 22),
         )
         self.assertEqual(selected, "20260904")
+
+    def test_option_quote_loader_retries_delayed_data_when_live_is_empty(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        market_data_types = []
+        builder.ib = SimpleNamespace(
+            reqMarketDataType=lambda value: market_data_types.append(value)
+        )
+        builder.action_logs = []
+        builder.log_action = lambda message: builder.action_logs.append(message)
+        builder._resolve_qqq_option_chain = lambda **kwargs: (
+            SimpleNamespace(strikes=[90.0, 95.0, 100.0, 105.0]),
+            "20260904",
+        )
+        delayed_quote = SimpleNamespace(bid=4.8, ask=5.0)
+        responses = iter([[], [delayed_quote]])
+        builder._request_qqq_option_quotes = lambda *args: next(responses)
+
+        quotes, expiry = builder._load_qqq_candidate_quotes(100.0)
+
+        self.assertEqual(expiry, "20260904")
+        self.assertEqual(quotes, [delayed_quote])
+        self.assertEqual(market_data_types, [3, 1])
+        self.assertIn("延迟行情", " ".join(builder.action_logs))
+
+    def test_blocked_signal_gets_structured_contract_scan_failure(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        today = datetime.datetime.now(self.module.NY_TZ).date()
+        builder.qqq_signal_context = SimpleNamespace(entry_date=today)
+        builder.qqq_strategy_signals = (
+            SimpleNamespace(
+                code="downtrend_defined_risk_combo",
+                title="下跌走势",
+                status="BLOCKED",
+            ),
+        )
+        builder.ib = SimpleNamespace(isConnected=lambda: False)
+        builder.action_logs = []
+        builder.log_action = lambda message: builder.action_logs.append(message)
+
+        builder.scan_qqq_option_contract_candidates()
+
+        output = "\n".join(builder.action_logs)
+        self.assertIn("[BLOCKED] 下跌走势", output)
+        self.assertIn("FAILED - IBKR未连接", output)
+
+    def test_chain_exception_is_reported_per_signal_instead_of_hiding_section(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        today = datetime.datetime.now(self.module.NY_TZ).date()
+        builder.qqq_signal_context = SimpleNamespace(entry_date=today)
+        builder.qqq_strategy_signals = (
+            SimpleNamespace(
+                code="downtrend_defined_risk_combo",
+                title="下跌走势",
+                status="WATCH",
+            ),
+        )
+        builder.ib = SimpleNamespace(isConnected=lambda: True)
+        builder.get_stock_price = lambda symbol: 690.0
+        builder._load_qqq_candidate_quotes = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("market data unavailable")
+        )
+        builder.action_logs = []
+        builder.log_action = lambda message: builder.action_logs.append(message)
+
+        builder.scan_qqq_option_contract_candidates()
+
+        output = "\n".join(builder.action_logs)
+        self.assertIn("[WATCH] 下跌走势", output)
+        self.assertIn("FAILED - IBKR期权链扫描异常", output)
+        self.assertIn("market data unavailable", output)
 
 
 if __name__ == "__main__":

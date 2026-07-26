@@ -81,7 +81,7 @@ class ContractScanResult:
     strategy_title: str
     signal_status: str
     quote_time: datetime
-    spot: float
+    spot: Optional[float]
     expiry: Optional[str] = None
     legs: Tuple[CandidateLeg, ...] = ()
     net_entry_credit: Optional[float] = None
@@ -181,7 +181,7 @@ def _failed(
     strategy_title: str,
     signal_status: str,
     quote_time: datetime,
-    spot: float,
+    spot: Optional[float],
     reason: str,
     expiry: Optional[str] = None,
 ) -> ContractScanResult:
@@ -193,6 +193,27 @@ def _failed(
         spot=spot,
         expiry=expiry,
         failure_reason=reason,
+    )
+
+
+def failed_contract_scan_result(
+    strategy_code: str,
+    strategy_title: str,
+    signal_status: str,
+    quote_time: datetime,
+    reason: str,
+    spot: Optional[float] = None,
+    expiry: Optional[str] = None,
+) -> ContractScanResult:
+    """Return an auditable result when broker-side enrichment cannot run."""
+    return _failed(
+        strategy_code,
+        strategy_title,
+        signal_status,
+        quote_time,
+        spot,
+        reason,
+        expiry=expiry,
     )
 
 
@@ -239,7 +260,10 @@ def build_uptrend_funded_call_candidate(
         entry_costs=costs,
         capital_required=short_put.strike * 100.0,
         max_loss=downside_loss,
-        notes=("现金担保下行口径；Long Call不抵消QQQ跌至零时的Short Put义务",),
+        notes=(
+            "筛选优先级：Put最接近-0.40 Delta，再选同到期且ask不超过Put bid、最接近预算上限的Call",
+            "现金担保下行口径；Long Call不抵消QQQ跌至零时的Short Put义务",
+        ),
     )
 
 
@@ -318,7 +342,10 @@ def build_downtrend_combo_candidate(
         entry_costs=costs,
         capital_required=max_loss,
         max_loss=max_loss,
-        notes=(f"Put翼宽 ${width:.2f}；最大损失含预计开仓费用、不含退出费用",),
+        notes=(
+            "筛选优先级：Short Put最接近-0.50 Delta、保护Put最接近10% spot翼宽，再用可执行净信用购买最接近预算上限的Call",
+            f"Put翼宽 ${width:.2f}；最大损失含预计开仓费用、不含退出费用",
+        ),
     )
 
 
@@ -405,15 +432,16 @@ def format_contract_scan_section(results: Sequence[ContractScanResult]) -> str:
         "成交口径: 买入按ask、卖出按bid；仅列候选，不创建或发送订单。",
     ]
     if not results:
-        lines.append("没有需要扫描的TRIGGERED/WATCH且未过期信号。")
+        lines.append("没有需要扫描的TRIGGERED/WATCH/BLOCKED且未过期信号。")
         return "\n".join(lines)
     for index, result in enumerate(results, start=1):
         quote_time = result.quote_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        spot_text = f"${result.spot:.2f}" if result.spot is not None else "缺失"
         lines.extend(
             [
                 "",
                 f"{index}. [{result.signal_status}] {result.strategy_title}",
-                f"报价快照: {quote_time} | QQQ ${result.spot:.2f} | 到期 {result.expiry or '未确定'}",
+                f"报价快照: {quote_time} | QQQ {spot_text} | 到期 {result.expiry or '未确定'}",
             ]
         )
         if result.failure_reason:
@@ -449,6 +477,8 @@ def format_contract_scan_section(results: Sequence[ContractScanResult]) -> str:
             lines.append(f"估算最大损失: ${result.max_loss:.2f}/组")
         if result.signal_status == "WATCH":
             lines.append("执行限制: WATCH仅供观察，未通过状态gate，不应据此下单。")
+        elif result.signal_status == "BLOCKED":
+            lines.append("执行限制: BLOCKED为风险审计候选，状态gate明确禁止下单。")
         for note in result.notes:
             lines.append(f"说明: {note}")
     lines.append("提示: 报价为邮件生成时快照；临近收盘必须重新确认Delta、bid/ask与流动性。")

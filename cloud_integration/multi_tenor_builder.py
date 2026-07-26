@@ -29,6 +29,7 @@ from qqq_contract_scanner import (
     build_downtrend_combo_candidate,
     build_uptrend_funded_call_candidate,
     build_wall_debit_spread_candidate,
+    failed_contract_scan_result,
     format_contract_scan_section,
 )
 
@@ -898,7 +899,32 @@ class UnifiedLedgerBuilder:
         )
         if not strikes:
             raise RuntimeError("IBKR期权链没有候选执行价")
-        return self._request_qqq_option_quotes(expiry, strikes, rights), expiry
+        quotes = self._request_qqq_option_quotes(expiry, strikes, rights)
+        has_executable_market_data = any(
+            self._finite_float(quote.bid) is not None
+            and self._finite_float(quote.ask) is not None
+            and quote.bid >= 0
+            and quote.ask >= quote.bid
+            for quote in quotes
+        )
+        allow_delayed = bool(
+            getattr(cfg, 'QQQ_ALLOW_DELAYED_MARKET_DATA_FALLBACK', True)
+        )
+        if has_executable_market_data or not allow_delayed:
+            return quotes, expiry
+
+        self.log_action(
+            "  [WARN] IBKR实时QQQ期权报价为空，自动切换延迟行情重试；"
+            "邮件将标注实际marketDataType。"
+        )
+        self.ib.reqMarketDataType(3)
+        try:
+            delayed_quotes = self._request_qqq_option_quotes(
+                expiry, strikes, rights
+            )
+        finally:
+            self.ib.reqMarketDataType(1)
+        return delayed_quotes or quotes, expiry
 
     def scan_qqq_research_signals(self):
         self.log_action("\n[QQQ 冻结策略信号扫描]")
@@ -968,7 +994,7 @@ class UnifiedLedgerBuilder:
             active = [
                 signal
                 for signal in signals
-                if signal.status in {'TRIGGERED', 'WATCH'}
+                if signal.status in {'TRIGGERED', 'WATCH', 'BLOCKED'}
             ]
             if not active:
                 self.log_action(format_contract_scan_section([]))
@@ -981,7 +1007,19 @@ class UnifiedLedgerBuilder:
                 )
                 return
             if not self.ib.isConnected():
-                self.log_action("  [WARN] IBKR未连接，保留策略文字但无法取得逐腿报价。")
+                unavailable = [
+                    failed_contract_scan_result(
+                        signal.code,
+                        signal.title,
+                        signal.status,
+                        now,
+                        "IBKR未连接，无法读取真实期权链与逐腿报价",
+                    )
+                    for signal in active
+                ]
+                section = format_contract_scan_section(unavailable)
+                for line in section.splitlines():
+                    self.log_action(line)
                 return
 
             spot = self.get_stock_price('QQQ')
@@ -1006,35 +1044,48 @@ class UnifiedLedgerBuilder:
                     for signal in common
                 ):
                     centers.append(spot * 0.90)
-                quotes, _ = self._load_qqq_candidate_quotes(
-                    spot,
-                    target_days=45,
-                    centers=centers,
-                    rights=('P', 'C'),
-                )
-                puts = [quote for quote in quotes if quote.right == 'P']
-                calls = [quote for quote in quotes if quote.right == 'C']
-                for signal in common:
-                    if signal.code == 'uptrend_funded_call':
-                        results.append(
-                            build_uptrend_funded_call_candidate(
-                                puts,
-                                calls,
-                                spot,
-                                now,
-                                signal_status=signal.status,
-                                entry_cost_per_contract=entry_cost,
+                try:
+                    quotes, _ = self._load_qqq_candidate_quotes(
+                        spot,
+                        target_days=45,
+                        centers=centers,
+                        rights=('P', 'C'),
+                    )
+                    puts = [quote for quote in quotes if quote.right == 'P']
+                    calls = [quote for quote in quotes if quote.right == 'C']
+                    for signal in common:
+                        if signal.code == 'uptrend_funded_call':
+                            results.append(
+                                build_uptrend_funded_call_candidate(
+                                    puts,
+                                    calls,
+                                    spot,
+                                    now,
+                                    signal_status=signal.status,
+                                    entry_cost_per_contract=entry_cost,
+                                )
                             )
-                        )
-                    else:
+                        else:
+                            results.append(
+                                build_downtrend_combo_candidate(
+                                    puts,
+                                    calls,
+                                    spot,
+                                    now,
+                                    signal_status=signal.status,
+                                    entry_cost_per_contract=entry_cost,
+                                )
+                            )
+                except Exception as exc:
+                    for signal in common:
                         results.append(
-                            build_downtrend_combo_candidate(
-                                puts,
-                                calls,
-                                spot,
+                            failed_contract_scan_result(
+                                signal.code,
+                                signal.title,
+                                signal.status,
                                 now,
-                                signal_status=signal.status,
-                                entry_cost_per_contract=entry_cost,
+                                f"IBKR期权链扫描异常: {exc}",
+                                spot=spot,
                             )
                         )
 
@@ -1052,27 +1103,40 @@ class UnifiedLedgerBuilder:
                 outer = (
                     wall + spot * 0.05 if right == 'C' else wall - spot * 0.05
                 )
-                quotes, expiry = self._load_qqq_candidate_quotes(
-                    spot,
-                    exact_expiry=context.wall_expiry,
-                    centers=[wall, outer],
-                    rights=(right,),
-                    count_per_center=7,
-                )
-                results.append(
-                    build_wall_debit_spread_candidate(
-                        quotes,
-                        spot=spot,
-                        quote_time=now,
-                        expiry=datetime.datetime.strptime(
-                            expiry, '%Y%m%d'
-                        ).date().isoformat(),
-                        right=right,
-                        wall_strike=wall,
-                        signal_status=signal.status,
-                        entry_cost_per_contract=entry_cost,
+                try:
+                    quotes, expiry = self._load_qqq_candidate_quotes(
+                        spot,
+                        exact_expiry=context.wall_expiry,
+                        centers=[wall, outer],
+                        rights=(right,),
+                        count_per_center=7,
                     )
-                )
+                    results.append(
+                        build_wall_debit_spread_candidate(
+                            quotes,
+                            spot=spot,
+                            quote_time=now,
+                            expiry=datetime.datetime.strptime(
+                                expiry, '%Y%m%d'
+                            ).date().isoformat(),
+                            right=right,
+                            wall_strike=wall,
+                            signal_status=signal.status,
+                            entry_cost_per_contract=entry_cost,
+                        )
+                    )
+                except Exception as exc:
+                    results.append(
+                        failed_contract_scan_result(
+                            signal.code,
+                            signal.title,
+                            signal.status,
+                            now,
+                            f"IBKR期权墙合约扫描异常: {exc}",
+                            spot=spot,
+                            expiry=context.wall_expiry.isoformat(),
+                        )
+                    )
 
             section = format_contract_scan_section(results)
             for line in section.splitlines():
@@ -1413,7 +1477,14 @@ class UnifiedLedgerBuilder:
             # This scanner does not depend on IBKR and should still report if
             # the broker connection later fails.
             self.scan_qqq_research_signals()
-            self.connect()
+            try:
+                self.connect()
+            except Exception as exc:
+                self.log_action(
+                    f"  [WARN] IBKR连接失败，仍输出QQQ逐策略合约扫描失败原因: {exc}"
+                )
+                self.scan_qqq_option_contract_candidates()
+                raise
             self.scan_qqq_option_contract_candidates()
             # 🚀 在建仓和推演前先对账，确保账面干净！
             self.reconcile_executions()

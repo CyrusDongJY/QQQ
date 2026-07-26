@@ -63,8 +63,13 @@ specific QQQ contracts:
 Every leg prints expiry, strike, Delta, bid/ask/mid, IV, OI, volume, IBKR market
 data type and the fill side. Combination credit/debit always uses leg-level
 bid/ask. Invalid, crossed, overly wide or low-OI quotes are rejected, with the
-failure reason retained in the email. `WATCH` candidates are labeled as
-non-executable. The optional cloud setting
+failure reason retained in the email. Every displayed `TRIGGERED`, `WATCH` or
+`BLOCKED` signal receives either a concrete candidate or an explicit broker/
+quote failure result. `WATCH` and `BLOCKED` candidates are labeled as
+non-executable. If live IBKR option quotes are empty, the scanner retries with
+delayed market data and labels the returned market-data type. Set
+`QQQ_ALLOW_DELAYED_MARKET_DATA_FALLBACK=False` to disable this fallback. The
+optional cloud setting
 `QQQ_OPTION_ENTRY_COST_PER_CONTRACT` defaults to `$0.67` per opening leg.
 
 The 15:35 ET scan is a candidate snapshot, not a locked EOD fill and never
