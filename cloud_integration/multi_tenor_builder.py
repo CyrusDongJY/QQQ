@@ -1038,21 +1038,29 @@ class UnifiedLedgerBuilder:
                 }
             ]
             if common:
-                centers = [spot]
+                put_centers = [spot]
                 if any(
                     signal.code == 'downtrend_defined_risk_combo'
                     for signal in common
                 ):
-                    centers.append(spot * 0.90)
+                    put_centers.append(spot * 0.90)
+                # Calls must be sampled above spot as well. Sampling every
+                # right around the protective-put center omitted affordable
+                # OTM calls even when the put spread produced ample credit.
+                call_centers = [spot, spot * 1.03]
                 try:
-                    quotes, _ = self._load_qqq_candidate_quotes(
+                    puts, _ = self._load_qqq_candidate_quotes(
                         spot,
                         target_days=45,
-                        centers=centers,
-                        rights=('P', 'C'),
+                        centers=put_centers,
+                        rights=('P',),
                     )
-                    puts = [quote for quote in quotes if quote.right == 'P']
-                    calls = [quote for quote in quotes if quote.right == 'C']
+                    calls, _ = self._load_qqq_candidate_quotes(
+                        spot,
+                        target_days=45,
+                        centers=call_centers,
+                        rights=('C',),
+                    )
                     for signal in common:
                         if signal.code == 'uptrend_funded_call':
                             results.append(

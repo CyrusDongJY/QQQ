@@ -72,6 +72,10 @@ delayed market data and labels the returned market-data type. Set
 optional cloud setting
 `QQQ_OPTION_ENTRY_COST_PER_CONTRACT` defaults to `$0.67` per opening leg.
 
+Put and call strikes are sampled separately. Put candidates cover spot and the
+10%-spot protective-wing area; call candidates cover spot and approximately 3%
+above spot so the budget-constrained OTM call is not accidentally omitted.
+
 The 15:35 ET scan is a candidate snapshot, not a locked EOD fill and never
 creates an IBKR order. The email instructs the operator to recheck Delta,
 bid/ask and liquidity near the close. Because the current session is unfinished

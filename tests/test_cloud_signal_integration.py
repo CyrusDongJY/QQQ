@@ -354,6 +354,38 @@ class CloudSignalIntegrationTests(unittest.TestCase):
         self.assertIn("FAILED - IBKR期权链扫描异常", output)
         self.assertIn("market data unavailable", output)
 
+    def test_downtrend_samples_put_wing_and_otm_calls_separately(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        today = datetime.datetime.now(self.module.NY_TZ).date()
+        builder.qqq_signal_context = SimpleNamespace(entry_date=today)
+        builder.qqq_strategy_signals = (
+            SimpleNamespace(
+                code="downtrend_defined_risk_combo",
+                title="下跌走势",
+                status="WATCH",
+            ),
+        )
+        builder.ib = SimpleNamespace(isConnected=lambda: True)
+        builder.get_stock_price = lambda symbol: 100.0
+        calls = []
+
+        def load_quotes(spot, **kwargs):
+            calls.append(kwargs)
+            return [], "20260904"
+
+        builder._load_qqq_candidate_quotes = load_quotes
+        builder.action_logs = []
+        builder.log_action = lambda message: builder.action_logs.append(message)
+
+        builder.scan_qqq_option_contract_candidates()
+
+        self.assertEqual(calls[0]["rights"], ("P",))
+        self.assertEqual(calls[0]["centers"], [100.0, 90.0])
+        self.assertEqual(calls[1]["rights"], ("C",))
+        self.assertEqual(calls[1]["centers"], [100.0, 103.0])
+
 
 if __name__ == "__main__":
     unittest.main()
