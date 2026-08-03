@@ -176,6 +176,97 @@ def _select_affordable_call(
     )
 
 
+def _format_quote_brief(quote: LiveOptionQuote) -> str:
+    return (
+        f"${quote.strike:g}{quote.right.upper()} ask ${quote.ask:.2f} "
+        f"Delta {quote.delta:+.3f} OI {_format_optional_int(quote.open_interest)} "
+        f"spread {quote.relative_spread:.0%}"
+    )
+
+
+def _basic_call_market_valid(quote: LiveOptionQuote) -> bool:
+    numeric = (quote.strike, quote.bid, quote.ask, quote.delta)
+    if not all(math.isfinite(float(value)) for value in numeric):
+        return False
+    return (
+        quote.right.upper() == "C"
+        and quote.strike > 0
+        and quote.bid >= 0
+        and quote.ask > 0
+        and quote.ask >= quote.bid
+        and 0 < quote.delta <= 1.0
+    )
+
+
+def _affordable_call_failure_notes(
+    calls: Sequence[LiveOptionQuote],
+    expiry: str,
+    budget: float,
+) -> Tuple[str, ...]:
+    same_expiry = [
+        quote
+        for quote in calls
+        if quote.right.upper() == "C" and quote.expiry == expiry
+    ]
+    if not same_expiry:
+        return ("Call诊断: 同到期Call报价为0个；优先检查IB链请求/执行价采样范围。",)
+
+    strikes = [quote.strike for quote in same_expiry if math.isfinite(quote.strike)]
+    market_valid = [quote for quote in same_expiry if _basic_call_market_valid(quote)]
+    tradeable = [quote for quote in same_expiry if quote.is_tradeable()]
+    affordable_tradeable = [quote for quote in tradeable if quote.ask <= budget + 1e-12]
+    affordable_market = [
+        quote for quote in market_valid if quote.ask <= budget + 1e-12
+    ]
+    notes = [
+        (
+            "Call诊断: "
+            f"同到期扫描{len(same_expiry)}个"
+            + (
+                f"，执行价范围 ${min(strikes):g}-${max(strikes):g}"
+                if strikes
+                else ""
+            )
+            + f"；报价/Delta有效{len(market_valid)}个，可交易{len(tradeable)}个，"
+            f"预算内可交易{len(affordable_tradeable)}个。"
+        )
+    ]
+    if tradeable:
+        cheapest = min(tradeable, key=lambda quote: quote.ask)
+        richest_affordable = max(
+            affordable_tradeable, key=lambda quote: quote.ask
+        ) if affordable_tradeable else None
+        note = f"最低可交易Call: {_format_quote_brief(cheapest)}。"
+        if richest_affordable is not None:
+            note += f" 预算内最高ask: {_format_quote_brief(richest_affordable)}。"
+        elif cheapest.ask > budget:
+            note += f" 最低可交易ask仍高于预算 ${budget:.2f}。"
+        notes.append(note)
+    if affordable_market and not affordable_tradeable:
+        rejected = [
+            quote for quote in affordable_market if not quote.is_tradeable()
+        ]
+        low_oi = sum(
+            1
+            for quote in rejected
+            if quote.open_interest is None
+            or int(quote.open_interest) < DEFAULT_MIN_OPEN_INTEREST
+        )
+        wide_spread = sum(
+            1
+            for quote in rejected
+            if quote.relative_spread > DEFAULT_MAX_RELATIVE_SPREAD
+        )
+        notes.append(
+            "预算内但未通过流动性过滤的Call: "
+            f"{len(rejected)}个；OI不足/缺失{low_oi}个，"
+            f"价差过宽{wide_spread}个。"
+        )
+    if not market_valid:
+        notes.append("同到期Call均缺少有效bid/ask或Delta；需要检查IB行情权限/延迟行情。")
+    return tuple(notes)
+
+
 def _failed(
     strategy_code: str,
     strategy_title: str,
@@ -184,6 +275,7 @@ def _failed(
     spot: Optional[float],
     reason: str,
     expiry: Optional[str] = None,
+    notes: Sequence[str] = (),
 ) -> ContractScanResult:
     return ContractScanResult(
         strategy_code=strategy_code,
@@ -193,6 +285,7 @@ def _failed(
         spot=spot,
         expiry=expiry,
         failure_reason=reason,
+        notes=tuple(notes),
     )
 
 
@@ -241,6 +334,9 @@ def build_uptrend_funded_call_candidate(
             spot,
             f"同到期没有ask不超过Short Put bid ${short_put.bid:.2f}的可交易Call",
             expiry=short_put.expiry,
+            notes=_affordable_call_failure_notes(
+                calls, short_put.expiry, short_put.bid
+            ),
         )
     net_credit = short_put.bid - call.ask
     costs = 2 * entry_cost_per_contract
@@ -321,6 +417,9 @@ def build_downtrend_combo_candidate(
             spot,
             f"同到期没有ask不超过Put Spread净信用 ${put_spread_credit:.2f}的可交易Call",
             expiry=short_put.expiry,
+            notes=_affordable_call_failure_notes(
+                calls, short_put.expiry, put_spread_credit
+            ),
         )
     net_credit = put_spread_credit - call.ask
     costs = 3 * entry_cost_per_contract
@@ -446,6 +545,8 @@ def format_contract_scan_section(results: Sequence[ContractScanResult]) -> str:
         )
         if result.failure_reason:
             lines.append(f"扫描结果: FAILED - {result.failure_reason}")
+            for note in result.notes:
+                lines.append(f"说明: {note}")
             continue
         lines.append("具体合约:")
         for leg in result.legs:

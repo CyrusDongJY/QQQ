@@ -384,7 +384,11 @@ class CloudSignalIntegrationTests(unittest.TestCase):
         self.assertEqual(calls[0]["rights"], ("P",))
         self.assertEqual(calls[0]["centers"], [100.0, 90.0])
         self.assertEqual(calls[1]["rights"], ("C",))
-        self.assertEqual(calls[1]["centers"], [100.0, 103.0])
+        self.assertEqual(
+            [round(center, 6) for center in calls[1]["centers"]],
+            [100.0, 103.0, 106.0, 110.0],
+        )
+        self.assertEqual(calls[1]["count_per_center"], 21)
 
 
 if __name__ == "__main__":

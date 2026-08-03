@@ -1044,10 +1044,25 @@ class UnifiedLedgerBuilder:
                     for signal in common
                 ):
                     put_centers.append(spot * 0.90)
-                # Calls must be sampled above spot as well. Sampling every
-                # right around the protective-put center omitted affordable
-                # OTM calls even when the put spread produced ample credit.
-                call_centers = [spot, spot * 1.03]
+                # Calls must be sampled well above spot. A strict funded-call
+                # budget can push the affordable long call materially OTM.
+                call_center_multipliers = tuple(
+                    float(value)
+                    for value in getattr(
+                        cfg,
+                        'QQQ_FUNDED_CALL_CENTER_MULTIPLIERS',
+                        (1.00, 1.03, 1.06, 1.10),
+                    )
+                    if self._finite_float(value) is not None and float(value) > 0
+                )
+                call_count_per_center = int(
+                    getattr(cfg, 'QQQ_FUNDED_CALL_COUNT_PER_CENTER', 21)
+                )
+                if not call_center_multipliers:
+                    call_center_multipliers = (1.00, 1.03, 1.06, 1.10)
+                call_centers = [
+                    spot * multiplier for multiplier in call_center_multipliers
+                ]
                 try:
                     puts, _ = self._load_qqq_candidate_quotes(
                         spot,
@@ -1060,6 +1075,7 @@ class UnifiedLedgerBuilder:
                         target_days=45,
                         centers=call_centers,
                         rights=('C',),
+                        count_per_center=call_count_per_center,
                     )
                     for signal in common:
                         if signal.code == 'uptrend_funded_call':
