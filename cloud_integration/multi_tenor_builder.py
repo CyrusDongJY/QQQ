@@ -77,6 +77,47 @@ class OptionLeg:
     def is_liquid(self) -> bool:
         return self.spread_pct < 15.0 and self.open_interest > 10
 
+
+@dataclass(frozen=True)
+class QQQQuoteRequestDiagnostics:
+    requested_market_data_type: int
+    requested_contracts: int
+    qualified_contracts: int
+    quote_objects: int
+    valid_markets: int
+    valid_deltas: int
+    oi_available: int
+    complete_quotes: int
+    errors: Tuple[str, ...] = ()
+
+    @property
+    def score(self):
+        return (
+            self.complete_quotes,
+            min(self.valid_markets, self.valid_deltas),
+            self.valid_markets,
+            self.valid_deltas,
+            self.oi_available,
+            self.quote_objects,
+        )
+
+    def format_note(self, label):
+        type_label = {
+            1: '实时', 2: '冻结', 3: '延迟', 4: '延迟冻结',
+        }.get(
+            self.requested_market_data_type,
+            str(self.requested_market_data_type),
+        )
+        note = (
+            f"{label}{type_label}行情采集: 请求{self.requested_contracts}个，"
+            f"资格确认{self.qualified_contracts}个，返回对象{self.quote_objects}个，"
+            f"bid/ask有效{self.valid_markets}个，Delta有效{self.valid_deltas}个，"
+            f"OI有值{self.oi_available}个，三项完整{self.complete_quotes}个。"
+        )
+        if self.errors:
+            note += " IB错误: " + " | ".join(self.errors)
+        return note
+
 class UnifiedLedgerBuilder:
     def __init__(self, host='127.0.0.1', port=4001, client_id=889):
         self.ib = IB()
@@ -774,7 +815,20 @@ class UnifiedLedgerBuilder:
         )
         if not chains:
             raise RuntimeError("IBKR未返回QQQ期权链定义")
-        chain = next((item for item in chains if item.exchange == 'SMART'), chains[0])
+        chain = next(
+            (
+                item
+                for item in chains
+                if item.exchange == 'SMART'
+                and str(getattr(item, 'tradingClass', '')).upper() == 'QQQ'
+            ),
+            None,
+        )
+        if chain is None:
+            chain = next(
+                (item for item in chains if item.exchange == 'SMART'),
+                chains[0],
+            )
         if exact_expiry is not None:
             requested = exact_expiry.strftime('%Y%m%d')
             expiry = requested if requested in chain.expirations else None
@@ -788,97 +842,251 @@ class UnifiedLedgerBuilder:
             raise RuntimeError(f"IBKR链中没有{requested_text}的可用到期日")
         return chain, expiry
 
-    def _request_qqq_option_quotes(self, expiry, strikes, rights):
+    @staticmethod
+    def _best_option_greeks(ticker):
+        for attr in ('modelGreeks', 'bidGreeks', 'askGreeks', 'lastGreeks'):
+            greeks = getattr(ticker, attr, None)
+            if (
+                greeks is not None
+                and UnifiedLedgerBuilder._finite_float(
+                    getattr(greeks, 'delta', None)
+                ) is not None
+            ):
+                return greeks
+        return None
+
+    @staticmethod
+    def _quote_has_valid_market(quote):
+        return (
+            UnifiedLedgerBuilder._finite_float(quote.bid) is not None
+            and UnifiedLedgerBuilder._finite_float(quote.ask) is not None
+            and quote.bid >= 0
+            and quote.ask > 0
+            and quote.ask >= quote.bid
+        )
+
+    @staticmethod
+    def _ticker_option_open_interest(ticker):
+        contract = getattr(ticker, 'contract', None)
+        right = str(getattr(contract, 'right', '')).upper()
+        side_oi = getattr(
+            ticker,
+            'putOpenInterest' if right == 'P' else 'callOpenInterest',
+            None,
+        )
+        return UnifiedLedgerBuilder._first_nonnegative_int(
+            side_oi,
+            getattr(ticker, 'openInterest', None),
+        )
+
+    @staticmethod
+    def _ticker_market_data_type(ticker, requested_market_data_type):
+        actual = UnifiedLedgerBuilder._first_nonnegative_int(
+            getattr(ticker, 'marketDataType', None)
+        )
+        return actual if actual in {1, 2, 3, 4} else requested_market_data_type
+
+    def _request_qqq_option_quotes(
+        self,
+        chain,
+        expiry,
+        strikes,
+        rights,
+        requested_market_data_type=1,
+    ):
         quotes = []
+        errors = []
+        qualified_count = 0
+        ignored_error_codes = {2104, 2106, 2107, 2108, 2119, 2158}
+
+        def on_error(req_id, error_code, error_string, contract):
+            if error_code in ignored_error_codes:
+                return
+            message = f"{error_code} {str(error_string).strip()}"
+            if message not in errors and len(errors) < 6:
+                errors.append(message)
+
+        trading_class = str(getattr(chain, 'tradingClass', '') or 'QQQ')
+        multiplier = str(getattr(chain, 'multiplier', '') or '100')
         contracts = [
-            Option('QQQ', expiry, strike, right, 'SMART')
+            Option(
+                'QQQ',
+                expiry,
+                strike,
+                right,
+                'SMART',
+                multiplier=multiplier,
+                currency='USD',
+                tradingClass=trading_class,
+            )
             for right in rights
             for strike in strikes
         ]
-        batch_size = 16
+        batch_size = max(
+            1,
+            int(getattr(cfg, 'QQQ_OPTION_QUOTE_BATCH_SIZE', 20)),
+        )
+        wait_seconds = max(
+            1.0,
+            float(getattr(cfg, 'QQQ_OPTION_QUOTE_WAIT_SECONDS', 8.0)),
+        )
+        ready_ratio = min(
+            1.0,
+            max(
+                0.1,
+                float(getattr(cfg, 'QQQ_OPTION_QUOTE_READY_RATIO', 0.60)),
+            ),
+        )
+        generic_ticks = str(
+            getattr(cfg, 'QQQ_OPTION_GENERIC_TICKS', '100,101,106')
+        )
         expiry_iso = datetime.datetime.strptime(expiry, '%Y%m%d').date().isoformat()
-        for start in range(0, len(contracts), batch_size):
-            batch = contracts[start:start + batch_size]
-            try:
-                qualified = self.ib.qualifyContracts(*batch)
-            except Exception as exc:
-                self.logger.warning(f"QQQ候选合约资格校验失败: {exc}")
-                continue
-            qualified = [contract for contract in qualified if contract.conId]
-            if not qualified:
-                continue
-            tickers = [
-                self.ib.reqMktData(contract, '100,101,106', False, False)
-                for contract in qualified
-            ]
-            try:
-                for _ in range(35):
-                    self.ib.sleep(0.1)
-                    ready = sum(
-                        1
-                        for ticker in tickers
-                        if ticker.modelGreeks
-                        and self._finite_float(ticker.modelGreeks.delta) is not None
-                        and self._finite_float(ticker.bid) is not None
-                        and self._finite_float(ticker.ask) is not None
+        error_event = getattr(self.ib, 'errorEvent', None)
+        if error_event is not None:
+            error_event += on_error
+        try:
+            for start in range(0, len(contracts), batch_size):
+                batch = contracts[start:start + batch_size]
+                try:
+                    qualified = self.ib.qualifyContracts(*batch)
+                except Exception as exc:
+                    self.logger.warning(f"QQQ候选合约资格校验失败: {exc}")
+                    message = f"资格校验异常 {type(exc).__name__}: {exc}"
+                    if message not in errors and len(errors) < 6:
+                        errors.append(message)
+                    continue
+                qualified = [contract for contract in qualified if contract.conId]
+                qualified_count += len(qualified)
+                if not qualified:
+                    continue
+                tickers = [
+                    self.ib.reqMktData(
+                        contract, generic_ticks, False, False
                     )
-                    if ready >= max(1, int(len(tickers) * 0.75)):
-                        break
-                self.ib.sleep(0.25)
-                for ticker in tickers:
-                    contract = ticker.contract
-                    greeks = ticker.modelGreeks
-                    delta = self._finite_float(
-                        greeks.delta if greeks is not None else None
-                    )
-                    if delta is None:
-                        continue
-                    bid = self._finite_float(ticker.bid)
-                    ask = self._finite_float(ticker.ask)
-                    right = str(contract.right).upper()
-                    side_oi = getattr(
-                        ticker,
-                        'putOpenInterest' if right == 'P' else 'callOpenInterest',
-                        None,
-                    )
-                    side_volume = getattr(
-                        ticker,
-                        'putVolume' if right == 'P' else 'callVolume',
-                        None,
-                    )
-                    quotes.append(
-                        LiveOptionQuote(
-                            underlying='QQQ',
-                            expiry=expiry_iso,
-                            right=right,
-                            strike=float(contract.strike),
-                            bid=bid if bid is not None else math.nan,
-                            ask=ask if ask is not None else math.nan,
-                            delta=delta,
-                            iv=self._finite_float(
-                                greeks.impliedVol if greeks is not None else None
-                            ),
-                            volume=self._first_nonnegative_int(
-                                getattr(ticker, 'volume', None), side_volume
-                            ),
-                            open_interest=self._first_nonnegative_int(
-                                getattr(ticker, 'openInterest', None), side_oi
-                            ),
-                            market_data_type=self._first_nonnegative_int(
-                                getattr(ticker, 'marketDataType', None)
-                            ),
-                            con_id=self._first_nonnegative_int(contract.conId),
-                            local_symbol=(
-                                str(contract.localSymbol).strip()
-                                if getattr(contract, 'localSymbol', None)
-                                else None
-                            ),
+                    for contract in qualified
+                ]
+                try:
+                    deadline = time.monotonic() + wait_seconds
+                    while time.monotonic() < deadline:
+                        self.ib.sleep(0.2)
+                        ready = sum(
+                            1
+                            for ticker in tickers
+                            if self._best_option_greeks(ticker) is not None
+                            and self._finite_float(
+                                getattr(ticker, 'bid', None)
+                            ) is not None
+                            and self._finite_float(
+                                getattr(ticker, 'ask', None)
+                            ) is not None
+                            and self._finite_float(
+                                getattr(ticker, 'bid', None)
+                            ) >= 0
+                            and self._finite_float(
+                                getattr(ticker, 'ask', None)
+                            ) > 0
+                            and self._finite_float(
+                                getattr(ticker, 'ask', None)
+                            )
+                            >= self._finite_float(
+                                getattr(ticker, 'bid', None)
+                            )
+                            and self._ticker_option_open_interest(ticker)
+                            is not None
                         )
-                    )
-            finally:
-                for contract in qualified:
-                    self.ib.cancelMktData(contract)
-        return quotes
+                        if ready >= max(1, math.ceil(len(tickers) * ready_ratio)):
+                            break
+                    self.ib.sleep(0.35)
+                    for ticker in tickers:
+                        contract = ticker.contract
+                        greeks = self._best_option_greeks(ticker)
+                        delta = self._finite_float(
+                            getattr(greeks, 'delta', None)
+                        )
+                        bid = self._finite_float(getattr(ticker, 'bid', None))
+                        ask = self._finite_float(getattr(ticker, 'ask', None))
+                        right = str(contract.right).upper()
+                        side_oi = getattr(
+                            ticker,
+                            'putOpenInterest' if right == 'P' else 'callOpenInterest',
+                            None,
+                        )
+                        side_volume = getattr(
+                            ticker,
+                            'putVolume' if right == 'P' else 'callVolume',
+                            None,
+                        )
+                        quotes.append(
+                            LiveOptionQuote(
+                                underlying='QQQ',
+                                expiry=expiry_iso,
+                                right=right,
+                                strike=float(contract.strike),
+                                bid=bid if bid is not None else math.nan,
+                                ask=ask if ask is not None else math.nan,
+                                delta=delta if delta is not None else math.nan,
+                                iv=self._finite_float(
+                                    getattr(greeks, 'impliedVol', None)
+                                ),
+                                volume=self._first_nonnegative_int(
+                                    getattr(ticker, 'volume', None), side_volume
+                                ),
+                                open_interest=self._first_nonnegative_int(
+                                    side_oi,
+                                    getattr(ticker, 'openInterest', None),
+                                ),
+                                market_data_type=self._ticker_market_data_type(
+                                    ticker,
+                                    requested_market_data_type,
+                                ),
+                                con_id=self._first_nonnegative_int(contract.conId),
+                                local_symbol=(
+                                    str(contract.localSymbol).strip()
+                                    if getattr(contract, 'localSymbol', None)
+                                    else None
+                                ),
+                            )
+                        )
+                finally:
+                    for contract in qualified:
+                        self.ib.cancelMktData(contract)
+        finally:
+            if error_event is not None:
+                error_event -= on_error
+
+        valid_markets = sum(
+            1 for quote in quotes if self._quote_has_valid_market(quote)
+        )
+        valid_deltas = sum(
+            1
+            for quote in quotes
+            if self._finite_float(quote.delta) is not None
+            and -1.0 <= quote.delta <= 1.0
+            and quote.delta != 0
+        )
+        oi_available = sum(
+            1 for quote in quotes if quote.open_interest is not None
+        )
+        complete_quotes = sum(
+            1
+            for quote in quotes
+            if self._quote_has_valid_market(quote)
+            and self._finite_float(quote.delta) is not None
+            and quote.delta != 0
+            and quote.open_interest is not None
+        )
+        diagnostics = QQQQuoteRequestDiagnostics(
+            requested_market_data_type=requested_market_data_type,
+            requested_contracts=len(contracts),
+            qualified_contracts=qualified_count,
+            quote_objects=len(quotes),
+            valid_markets=valid_markets,
+            valid_deltas=valid_deltas,
+            oi_available=oi_available,
+            complete_quotes=complete_quotes,
+            errors=tuple(errors),
+        )
+        return quotes, diagnostics
 
     def _load_qqq_candidate_quotes(
         self,
@@ -899,32 +1107,80 @@ class UnifiedLedgerBuilder:
         )
         if not strikes:
             raise RuntimeError("IBKR期权链没有候选执行价")
-        quotes = self._request_qqq_option_quotes(expiry, strikes, rights)
-        has_executable_market_data = any(
-            self._finite_float(quote.bid) is not None
-            and self._finite_float(quote.ask) is not None
-            and quote.bid >= 0
-            and quote.ask >= quote.bid
-            for quote in quotes
-        )
-        allow_delayed = bool(
-            getattr(cfg, 'QQQ_ALLOW_DELAYED_MARKET_DATA_FALLBACK', True)
-        )
-        if has_executable_market_data or not allow_delayed:
-            return quotes, expiry
-
-        self.log_action(
-            "  [WARN] IBKR实时QQQ期权报价为空，自动切换延迟行情重试；"
-            "邮件将标注实际marketDataType。"
-        )
-        self.ib.reqMarketDataType(3)
+        label = '/'.join(rights)
+        attempts = []
         try:
-            delayed_quotes = self._request_qqq_option_quotes(
-                expiry, strikes, rights
+            self.ib.reqMarketDataType(1)
+            quotes, diagnostics = self._request_qqq_option_quotes(
+                chain,
+                expiry,
+                strikes,
+                rights,
+                requested_market_data_type=1,
             )
+            attempts.append((quotes, diagnostics))
+            has_tradeable_quote = any(
+                quote.is_tradeable() for quote in quotes
+            )
+            allow_delayed = bool(
+                getattr(cfg, 'QQQ_ALLOW_DELAYED_MARKET_DATA_FALLBACK', True)
+            )
+            if not has_tradeable_quote and allow_delayed:
+                fallback_types = tuple(
+                    int(value)
+                    for value in getattr(
+                        cfg,
+                        'QQQ_OPTION_FALLBACK_MARKET_DATA_TYPES',
+                        (3, 4),
+                    )
+                    if int(value) in {2, 3, 4}
+                )
+                for market_data_type in dict.fromkeys(fallback_types):
+                    type_label = {2: '冻结', 3: '延迟', 4: '延迟冻结'}[
+                        market_data_type
+                    ]
+                    self.log_action(
+                        f"  [WARN] IBKR实时QQQ {label}期权没有可交易报价，"
+                        f"自动切换{type_label}行情重试；邮件将列出逐阶段统计。"
+                    )
+                    self.ib.reqMarketDataType(market_data_type)
+                    fallback_quotes, fallback_diagnostics = (
+                        self._request_qqq_option_quotes(
+                            chain,
+                            expiry,
+                            strikes,
+                            rights,
+                            requested_market_data_type=market_data_type,
+                        )
+                    )
+                    attempts.append(
+                        (fallback_quotes, fallback_diagnostics)
+                    )
+                    if any(
+                        quote.is_tradeable() for quote in fallback_quotes
+                    ):
+                        break
         finally:
             self.ib.reqMarketDataType(1)
-        return delayed_quotes or quotes, expiry
+        selected_quotes, selected_diagnostics = max(
+            attempts,
+            key=lambda item: (
+                sum(quote.is_tradeable() for quote in item[0]),
+                item[1].score,
+            ),
+        )
+        notes = [
+            item.format_note(f"{label} ")
+            for _, item in attempts
+        ]
+        selected_type = {
+            1: '实时', 2: '冻结', 3: '延迟', 4: '延迟冻结',
+        }.get(
+            selected_diagnostics.requested_market_data_type,
+            str(selected_diagnostics.requested_market_data_type),
+        )
+        notes.append(f"{label} 最终采用{selected_type}行情结果。")
+        return selected_quotes, expiry, tuple(notes)
 
     def scan_qqq_research_signals(self):
         self.log_action("\n[QQQ 冻结策略信号扫描]")
@@ -1064,19 +1320,30 @@ class UnifiedLedgerBuilder:
                     spot * multiplier for multiplier in call_center_multipliers
                 ]
                 try:
-                    puts, _ = self._load_qqq_candidate_quotes(
+                    puts, put_expiry, put_collection_notes = (
+                        self._load_qqq_candidate_quotes(
                         spot,
                         target_days=45,
                         centers=put_centers,
                         rights=('P',),
+                        )
                     )
-                    calls, _ = self._load_qqq_candidate_quotes(
+                    calls, call_expiry, call_collection_notes = (
+                        self._load_qqq_candidate_quotes(
                         spot,
                         target_days=45,
                         centers=call_centers,
                         rights=('C',),
                         count_per_center=call_count_per_center,
+                        )
                     )
+                    expected_expiry = datetime.datetime.strptime(
+                        put_expiry, '%Y%m%d'
+                    ).date().isoformat()
+                    if call_expiry != put_expiry:
+                        call_collection_notes = tuple(call_collection_notes) + (
+                            f"Call请求到期{call_expiry}与Put请求到期{put_expiry}不一致。",
+                        )
                     for signal in common:
                         if signal.code == 'uptrend_funded_call':
                             results.append(
@@ -1087,6 +1354,9 @@ class UnifiedLedgerBuilder:
                                     now,
                                     signal_status=signal.status,
                                     entry_cost_per_contract=entry_cost,
+                                    expected_expiry=expected_expiry,
+                                    put_collection_notes=put_collection_notes,
+                                    call_collection_notes=call_collection_notes,
                                 )
                             )
                         else:
@@ -1098,6 +1368,9 @@ class UnifiedLedgerBuilder:
                                     now,
                                     signal_status=signal.status,
                                     entry_cost_per_contract=entry_cost,
+                                    expected_expiry=expected_expiry,
+                                    put_collection_notes=put_collection_notes,
+                                    call_collection_notes=call_collection_notes,
                                 )
                             )
                 except Exception as exc:
@@ -1128,12 +1401,14 @@ class UnifiedLedgerBuilder:
                     wall + spot * 0.05 if right == 'C' else wall - spot * 0.05
                 )
                 try:
-                    quotes, expiry = self._load_qqq_candidate_quotes(
+                    quotes, expiry, collection_notes = (
+                        self._load_qqq_candidate_quotes(
                         spot,
                         exact_expiry=context.wall_expiry,
                         centers=[wall, outer],
                         rights=(right,),
                         count_per_center=7,
+                        )
                     )
                     results.append(
                         build_wall_debit_spread_candidate(
@@ -1147,6 +1422,7 @@ class UnifiedLedgerBuilder:
                             wall_strike=wall,
                             signal_status=signal.status,
                             entry_cost_per_contract=entry_cost,
+                            collection_notes=collection_notes,
                         )
                     )
                 except Exception as exc:

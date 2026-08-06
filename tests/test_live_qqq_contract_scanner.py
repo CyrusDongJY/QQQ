@@ -73,6 +73,25 @@ class LiveQQQContractScannerTests(unittest.TestCase):
         self.assertFalse(result.succeeded)
         self.assertIn("ask不超过", result.failure_reason)
 
+    def test_uptrend_put_failure_keeps_expiry_and_explains_oi_rejection(self):
+        result = build_uptrend_funded_call_candidate(
+            [quote("P", 100, 5.0, 5.2, -0.40, oi=None)],
+            [],
+            100.0,
+            QUOTE_TIME,
+            expected_expiry=EXPIRY,
+            put_collection_notes=(
+                "P 实时行情采集: 请求21个，资格确认21个，返回对象21个。",
+            ),
+        )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.expiry, EXPIRY)
+        text = format_contract_scan_section([result])
+        self.assertIn("到期 2026-09-04", text)
+        self.assertIn("OI>=10的0个", text)
+        self.assertIn("实时行情采集", text)
+
     def test_downtrend_three_legs_use_bid_ask_budget_and_defined_max_loss(self):
         puts = [
             quote("P", 100, 8.0, 8.2, -0.50),

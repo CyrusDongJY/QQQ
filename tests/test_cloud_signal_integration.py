@@ -292,16 +292,60 @@ class CloudSignalIntegrationTests(unittest.TestCase):
             SimpleNamespace(strikes=[90.0, 95.0, 100.0, 105.0]),
             "20260904",
         )
-        delayed_quote = SimpleNamespace(bid=4.8, ask=5.0)
-        responses = iter([[], [delayed_quote]])
-        builder._request_qqq_option_quotes = lambda *args: next(responses)
+        delayed_quote = SimpleNamespace(
+            bid=4.8,
+            ask=5.0,
+            is_tradeable=lambda: True,
+        )
+        diagnostics = self.module.QQQQuoteRequestDiagnostics
+        responses = iter(
+            [
+                (
+                    [],
+                    diagnostics(1, 4, 4, 0, 0, 0, 0, 0),
+                ),
+                (
+                    [delayed_quote],
+                    diagnostics(3, 4, 4, 1, 1, 1, 1, 1),
+                ),
+            ]
+        )
+        builder._request_qqq_option_quotes = lambda *args, **kwargs: next(
+            responses
+        )
 
-        quotes, expiry = builder._load_qqq_candidate_quotes(100.0)
+        quotes, expiry, notes = builder._load_qqq_candidate_quotes(100.0)
 
         self.assertEqual(expiry, "20260904")
         self.assertEqual(quotes, [delayed_quote])
-        self.assertEqual(market_data_types, [3, 1])
+        self.assertEqual(market_data_types, [1, 3, 1])
+        self.assertIn("最终采用延迟行情", " ".join(notes))
         self.assertIn("延迟行情", " ".join(builder.action_logs))
+
+    def test_best_option_greeks_uses_bid_ask_or_last_when_model_is_missing(self):
+        bid_greeks = SimpleNamespace(delta=-0.41, impliedVol=0.27)
+        ticker = SimpleNamespace(
+            modelGreeks=None,
+            bidGreeks=bid_greeks,
+            askGreeks=SimpleNamespace(delta=-0.39),
+            lastGreeks=SimpleNamespace(delta=-0.40),
+        )
+
+        selected = self.builder._best_option_greeks(ticker)
+
+        self.assertIs(selected, bid_greeks)
+
+    def test_option_open_interest_prefers_put_or_call_specific_tick(self):
+        ticker = SimpleNamespace(
+            contract=SimpleNamespace(right="P"),
+            putOpenInterest=187,
+            callOpenInterest=None,
+            openInterest=0,
+        )
+
+        open_interest = self.builder._ticker_option_open_interest(ticker)
+
+        self.assertEqual(open_interest, 187)
 
     def test_blocked_signal_gets_structured_contract_scan_failure(self):
         builder = self.module.UnifiedLedgerBuilder.__new__(
@@ -373,7 +417,7 @@ class CloudSignalIntegrationTests(unittest.TestCase):
 
         def load_quotes(spot, **kwargs):
             calls.append(kwargs)
-            return [], "20260904"
+            return [], "20260904", ("mock diagnostics",)
 
         builder._load_qqq_candidate_quotes = load_quotes
         builder.action_logs = []

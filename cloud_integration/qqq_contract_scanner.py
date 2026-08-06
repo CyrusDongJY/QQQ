@@ -176,6 +176,93 @@ def _select_affordable_call(
     )
 
 
+def _single_expiry(quotes: Sequence[LiveOptionQuote]) -> Optional[str]:
+    expiries = sorted({quote.expiry for quote in quotes if quote.expiry})
+    return expiries[0] if len(expiries) == 1 else None
+
+
+def _basic_option_market_valid(quote: LiveOptionQuote, right: str) -> bool:
+    numeric = (quote.strike, quote.bid, quote.ask)
+    return (
+        quote.right.upper() == right.upper()
+        and all(math.isfinite(float(value)) for value in numeric)
+        and quote.strike > 0
+        and quote.bid >= 0
+        and quote.ask > 0
+        and quote.ask >= quote.bid
+    )
+
+
+def _valid_option_delta(quote: LiveOptionQuote, right: str) -> bool:
+    if not math.isfinite(float(quote.delta)):
+        return False
+    if right.upper() == "P":
+        return -1.0 <= quote.delta < 0
+    return 0 < quote.delta <= 1.0
+
+
+def _selection_failure_notes(
+    quotes: Sequence[LiveOptionQuote],
+    right: str,
+    target_delta: float,
+    collection_notes: Sequence[str] = (),
+) -> Tuple[str, ...]:
+    expected_right = right.upper()
+    relevant = [quote for quote in quotes if quote.right.upper() == expected_right]
+    market_valid = [
+        quote for quote in relevant
+        if _basic_option_market_valid(quote, expected_right)
+    ]
+    delta_valid = [
+        quote for quote in relevant
+        if _valid_option_delta(quote, expected_right)
+    ]
+    spread_valid = [
+        quote for quote in market_valid
+        if quote.relative_spread <= DEFAULT_MAX_RELATIVE_SPREAD
+    ]
+    oi_valid = [
+        quote for quote in relevant
+        if quote.open_interest is not None
+        and int(quote.open_interest) >= DEFAULT_MIN_OPEN_INTEREST
+    ]
+    tradeable = [quote for quote in relevant if quote.is_tradeable()]
+    expiries = sorted({quote.expiry for quote in relevant if quote.expiry})
+    data_types = sorted(
+        {
+            int(quote.market_data_type)
+            for quote in relevant
+            if quote.market_data_type is not None
+        }
+    )
+    label = "Put" if expected_right == "P" else "Call"
+    notes = [
+        (
+            f"{label}筛选诊断: 收到{len(relevant)}个报价对象，"
+            f"bid/ask有效{len(market_valid)}个，Delta有效{len(delta_valid)}个，"
+            f"点差不超过{DEFAULT_MAX_RELATIVE_SPREAD:.0%}的{len(spread_valid)}个，"
+            f"OI>={DEFAULT_MIN_OPEN_INTEREST}的{len(oi_valid)}个，"
+            f"最终可交易{len(tradeable)}个；"
+            f"到期日{','.join(expiries) if expiries else '缺失'}，"
+            f"marketDataType{','.join(map(str, data_types)) if data_types else '缺失'}。"
+        )
+    ]
+    if delta_valid:
+        closest = min(
+            delta_valid,
+            key=lambda quote: abs(quote.delta - target_delta),
+        )
+        notes.append(
+            f"最接近目标Delta {target_delta:+.2f}的{label}: "
+            f"${closest.strike:g}{expected_right} Delta {closest.delta:+.3f}，"
+            f"bid/ask ${closest.bid:.2f}/${closest.ask:.2f}，"
+            f"OI {_format_optional_int(closest.open_interest)}，"
+            f"spread {closest.relative_spread:.0%}。"
+        )
+    notes.extend(str(note) for note in collection_notes if str(note).strip())
+    return tuple(notes)
+
+
 def _format_quote_brief(quote: LiveOptionQuote) -> str:
     return (
         f"${quote.strike:g}{quote.right.upper()} ask ${quote.ask:.2f} "
@@ -297,6 +384,7 @@ def failed_contract_scan_result(
     reason: str,
     spot: Optional[float] = None,
     expiry: Optional[str] = None,
+    notes: Sequence[str] = (),
 ) -> ContractScanResult:
     """Return an auditable result when broker-side enrichment cannot run."""
     return _failed(
@@ -307,6 +395,7 @@ def failed_contract_scan_result(
         spot,
         reason,
         expiry=expiry,
+        notes=notes,
     )
 
 
@@ -318,12 +407,29 @@ def build_uptrend_funded_call_candidate(
     signal_status: str = "TRIGGERED",
     target_put_delta: float = -0.40,
     entry_cost_per_contract: float = DEFAULT_ENTRY_COST_PER_CONTRACT,
+    expected_expiry: Optional[str] = None,
+    put_collection_notes: Sequence[str] = (),
+    call_collection_notes: Sequence[str] = (),
 ) -> ContractScanResult:
     code = "uptrend_funded_call"
     title = "上涨走势：2%盘中突破 Funded Call"
     short_put = _select_delta(puts, "P", target_put_delta)
     if short_put is None or short_put.bid <= 0:
-        return _failed(code, title, signal_status, quote_time, spot, "没有符合流动性与Delta要求的可卖Put")
+        return _failed(
+            code,
+            title,
+            signal_status,
+            quote_time,
+            spot,
+            "没有符合流动性与Delta要求的可卖Put",
+            expiry=expected_expiry or _single_expiry(puts),
+            notes=_selection_failure_notes(
+                puts,
+                "P",
+                target_put_delta,
+                put_collection_notes,
+            ),
+        )
     call = _select_affordable_call(calls, short_put.expiry, short_put.bid)
     if call is None:
         return _failed(
@@ -336,7 +442,7 @@ def build_uptrend_funded_call_candidate(
             expiry=short_put.expiry,
             notes=_affordable_call_failure_notes(
                 calls, short_put.expiry, short_put.bid
-            ),
+            ) + tuple(call_collection_notes),
         )
     net_credit = short_put.bid - call.ask
     costs = 2 * entry_cost_per_contract
@@ -372,12 +478,29 @@ def build_downtrend_combo_candidate(
     target_put_delta: float = -0.50,
     wing_width_pct: float = 0.10,
     entry_cost_per_contract: float = DEFAULT_ENTRY_COST_PER_CONTRACT,
+    expected_expiry: Optional[str] = None,
+    put_collection_notes: Sequence[str] = (),
+    call_collection_notes: Sequence[str] = (),
 ) -> ContractScanResult:
     code = "downtrend_defined_risk_combo"
     title = "下跌走势：1%回撤后三腿定义风险反弹组合"
     short_put = _select_delta(puts, "P", target_put_delta)
     if short_put is None or short_put.bid <= 0:
-        return _failed(code, title, signal_status, quote_time, spot, "没有符合流动性与Delta要求的可卖Put")
+        return _failed(
+            code,
+            title,
+            signal_status,
+            quote_time,
+            spot,
+            "没有符合流动性与Delta要求的可卖Put",
+            expiry=expected_expiry or _single_expiry(puts),
+            notes=_selection_failure_notes(
+                puts,
+                "P",
+                target_put_delta,
+                put_collection_notes,
+            ),
+        )
     target_wing = short_put.strike - spot * wing_width_pct
     long_put = _select_strike(
         puts,
@@ -395,6 +518,7 @@ def build_downtrend_combo_candidate(
             spot,
             "同到期没有符合报价质量的低执行价保护Put",
             expiry=short_put.expiry,
+            notes=tuple(put_collection_notes),
         )
     put_spread_credit = short_put.bid - long_put.ask
     if put_spread_credit <= 0:
@@ -406,6 +530,7 @@ def build_downtrend_combo_candidate(
             spot,
             f"Put Spread按bid/ask计算无可用净信用（${put_spread_credit:.2f}）",
             expiry=short_put.expiry,
+            notes=tuple(put_collection_notes),
         )
     call = _select_affordable_call(calls, short_put.expiry, put_spread_credit)
     if call is None:
@@ -419,7 +544,7 @@ def build_downtrend_combo_candidate(
             expiry=short_put.expiry,
             notes=_affordable_call_failure_notes(
                 calls, short_put.expiry, put_spread_credit
-            ),
+            ) + tuple(call_collection_notes),
         )
     net_credit = put_spread_credit - call.ask
     costs = 3 * entry_cost_per_contract
@@ -458,13 +583,23 @@ def build_wall_debit_spread_candidate(
     outer_width_pct: float = 0.05,
     signal_status: str = "TRIGGERED",
     entry_cost_per_contract: float = DEFAULT_ENTRY_COST_PER_CONTRACT,
+    collection_notes: Sequence[str] = (),
 ) -> ContractScanResult:
     code = "monthly_wall_break_debit_spread"
     title = "期权墙：标准月权突破顺势 Debit Spread"
     right = right.upper()
     long_leg = _select_strike(quotes, right, wall_strike, expiry)
     if long_leg is None:
-        return _failed(code, title, signal_status, quote_time, spot, "墙位附近没有可交易Long期权", expiry=expiry)
+        return _failed(
+            code,
+            title,
+            signal_status,
+            quote_time,
+            spot,
+            "墙位附近没有可交易Long期权",
+            expiry=expiry,
+            notes=tuple(collection_notes),
+        )
     if right == "C":
         outer_target = wall_strike + spot * outer_width_pct
         short_leg = _select_strike(
@@ -478,7 +613,16 @@ def build_wall_debit_spread_candidate(
     else:
         raise ValueError("right must be P or C")
     if short_leg is None or short_leg.bid <= 0:
-        return _failed(code, title, signal_status, quote_time, spot, "外侧卖出腿没有合格bid报价", expiry=expiry)
+        return _failed(
+            code,
+            title,
+            signal_status,
+            quote_time,
+            spot,
+            "外侧卖出腿没有合格bid报价",
+            expiry=expiry,
+            notes=tuple(collection_notes),
+        )
     net_debit = long_leg.ask - short_leg.bid
     if net_debit <= 0:
         return _failed(
@@ -489,6 +633,7 @@ def build_wall_debit_spread_candidate(
             spot,
             f"Debit Spread逐腿bid/ask净支出异常（${net_debit:.2f}）",
             expiry=expiry,
+            notes=tuple(collection_notes),
         )
     costs = 2 * entry_cost_per_contract
     max_loss = net_debit * 100.0 + costs

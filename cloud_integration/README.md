@@ -66,11 +66,17 @@ bid/ask. Invalid, crossed, overly wide or low-OI quotes are rejected, with the
 failure reason retained in the email. Every displayed `TRIGGERED`, `WATCH` or
 `BLOCKED` signal receives either a concrete candidate or an explicit broker/
 quote failure result. `WATCH` and `BLOCKED` candidates are labeled as
-non-executable. If live IBKR option quotes are empty, the scanner retries with
-delayed market data and labels the returned market-data type. Set
-`QQQ_ALLOW_DELAYED_MARKET_DATA_FALLBACK=False` to disable this fallback. The
-optional cloud setting
-`QQQ_OPTION_ENTRY_COST_PER_CONTRACT` defaults to `$0.67` per opening leg.
+non-executable. If live IBKR option quotes are unusable, the scanner retries
+with delayed and delayed-frozen market data and labels the returned market-data
+type. Quote collection uses the option chain's `tradingClass` and `multiplier`,
+accepts IBKR `modelGreeks`/`bidGreeks`/`askGreeks`/`lastGreeks` in that order,
+and reports per-attempt requested, qualified, bid/ask, Delta and OI counts when
+selection fails. Set `QQQ_ALLOW_DELAYED_MARKET_DATA_FALLBACK=False` to disable
+this fallback. The optional cloud setting `QQQ_OPTION_ENTRY_COST_PER_CONTRACT`
+defaults to `$0.67` per opening leg. Collection tuning defaults are
+`QQQ_OPTION_QUOTE_WAIT_SECONDS=8.0`, `QQQ_OPTION_QUOTE_BATCH_SIZE=20`,
+`QQQ_OPTION_QUOTE_READY_RATIO=0.60`, and
+`QQQ_OPTION_FALLBACK_MARKET_DATA_TYPES=(3, 4)`.
 
 Put and call strikes are sampled separately. Put candidates cover spot and the
 10%-spot protective-wing area; call candidates default to spot, 3%, 6% and 10%
