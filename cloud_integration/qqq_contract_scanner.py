@@ -676,7 +676,10 @@ def format_contract_scan_section(results: Sequence[ContractScanResult]) -> str:
         "成交口径: 买入按ask、卖出按bid；仅列候选，不创建或发送订单。",
     ]
     if not results:
-        lines.append("没有需要扫描的TRIGGERED/WATCH/BLOCKED且未过期信号。")
+        lines.append(
+            "没有需要扫描的TRIGGERED/WATCH/BLOCKED且未过期信号；"
+            "MISSED_WINDOW/STALE不会生成具体合约，避免按过期条件追单。"
+        )
         return "\n".join(lines)
     for index, result in enumerate(results, start=1):
         quote_time = result.quote_time.strftime("%Y-%m-%d %H:%M:%S %Z")

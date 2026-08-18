@@ -434,6 +434,75 @@ class CloudSignalIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(calls[1]["count_per_center"], 21)
 
+    def test_inventory_uses_ib_positions_and_audits_stale_ledger_rows(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+
+        class QueryStub:
+            def select(self, *args, **kwargs):
+                return self
+
+            def in_(self, *args, **kwargs):
+                return self
+
+            def order(self, *args, **kwargs):
+                return self
+
+        option_contract = SimpleNamespace(
+            symbol="QQQ",
+            secType="OPT",
+            lastTradeDateOrContractMonth="20260918",
+            strike=700.0,
+            right="P",
+            multiplier="100",
+            conId=12345,
+        )
+        builder.ib = SimpleNamespace(
+            positions=lambda: [
+                SimpleNamespace(
+                    contract=option_contract,
+                    position=-2.0,
+                    avgCost=1234.0,
+                )
+            ]
+        )
+        builder.supabase = SimpleNamespace(table=lambda name: QueryStub())
+        ledger_rows = [
+            {
+                "status": "ACTIVE",
+                "symbol": "QQQ",
+                "expiry": "20260918",
+                "strike": 700.0,
+                "right_type": "P",
+                "position_type": "short",
+                "quantity": 1,
+            },
+            {
+                "status": "ACTIVE",
+                "symbol": "QQQ",
+                "expiry": "20260821",
+                "strike": 650.0,
+                "right_type": "P",
+                "position_type": "long",
+                "quantity": 1,
+            },
+        ]
+        builder.execute_db_with_retry = lambda query, name: SimpleNamespace(
+            data=ledger_rows
+        )
+        builder.action_logs = []
+        builder.log_action = lambda message: builder.action_logs.append(message)
+
+        builder.print_current_inventory()
+
+        output = "\n".join(builder.action_logs)
+        self.assertIn("IBKR 实际当前持仓", output)
+        self.assertIn("空头 2x QQQ 20260918 $700P", output)
+        self.assertIn("IB平均成本 $12.3400/股", output)
+        self.assertIn("QQQ 20260918 $700P | Supabase -1 / IBKR -2", output)
+        self.assertIn("QQQ 20260821 $650P | Supabase +1 / IBKR +0", output)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -190,18 +190,14 @@ def _evaluate_wall_break(context: QQQSignalContext) -> StrategySignal:
         context.call_wall
     )
     walls_valid = wall_values_present and not walls_inverted
-    timing_valid = (
-        context.wall_expiry is not None
-        and context.wall_sessions_to_expiry == WALL_SIGNAL_SESSIONS_TO_EXPIRY
-    )
     direction = None
     wall = None
     distance = None
-    if walls_valid and timing_valid and context.close > float(context.call_wall):
+    if walls_valid and context.close > float(context.call_wall):
         direction = "call"
         wall = float(context.call_wall)
         distance = (context.close - wall) / context.close
-    elif walls_valid and timing_valid and context.close < float(context.put_wall):
+    elif walls_valid and context.close < float(context.put_wall):
         direction = "put"
         wall = float(context.put_wall)
         distance = wall / context.close - 1.0
@@ -243,11 +239,19 @@ def _evaluate_wall_break(context: QQQSignalContext) -> StrategySignal:
     )
     distance_text = f"{distance:.2%}" if distance is not None else "不适用"
     status = "NO_SIGNAL"
+    entry_rule = (
+        f"{context.entry_date.isoformat()} EOD（T+1）买 ask / 卖 bid；"
+        f"目标月权 {expiry_text}"
+    )
     caveats = ["OI墙不含持仓方向，不等同经 dealer side 校准的 Gamma Wall"]
     if walls_inverted:
         status = "WATCH"
         caveats.append("Put Wall 高于 Call Wall，墙数据倒挂；按数据质量异常处理，不生成交易指令")
-    elif within_break_distance:
+    elif (
+        within_break_distance
+        and context.wall_expiry is not None
+        and context.wall_sessions_to_expiry == WALL_SIGNAL_SESSIONS_TO_EXPIRY
+    ):
         if context.wall_data_expiry is None:
             status = "WATCH"
             caveats.append("数据库未提供 wall_expiry，无法确认墙值属于目标标准月权；不得执行")
@@ -267,17 +271,31 @@ def _evaluate_wall_break(context: QQQSignalContext) -> StrategySignal:
         else:
             status = "TRIGGERED"
     elif (
-        walls_valid
+        within_break_distance
         and context.wall_sessions_to_expiry == WALL_SIGNAL_SESSIONS_TO_EXPIRY - 1
     ):
         status = "MISSED_WINDOW"
+        entry_rule = (
+            f"不入场：标准月权信号窗口已错过；原目标月权 {expiry_text}"
+        )
+        legs = (
+            f"仅作历史审计：原方向为{direction_text}",
+            "本交易日不构建新期权组合，不按过期墙位追单",
+        )
         caveats.append("冻结信号日已错过；T+1后只剩4个结算交易日，不得追单")
+        if (
+            context.wall_data_expiry is not None
+            and context.wall_data_expiry != context.wall_expiry
+        ):
+            caveats.append(
+                f"墙数据到期日 {data_expiry_text} 与目标月权 {expiry_text} 不一致"
+            )
     return StrategySignal(
         code="monthly_wall_break_debit_spread",
         title="期权墙：标准月权突破顺势 Debit Spread",
         status=status,
         trigger="标准月权结算前第6个交易日，QQQ越过 Put/Call Wall 且越墙距离不超过3%",
-        entry_rule=f"{context.entry_date.isoformat()} EOD（T+1）买 ask / 卖 bid；目标月权 {expiry_text}",
+        entry_rule=entry_rule,
         legs=legs,
         exit_rule="持有到该月权到期，以实际成交/到期内在价值核算",
         risk_rule="最大损失为 Debit Spread 净支付权利金，可发生100%权利金损失",
@@ -375,7 +393,26 @@ def format_signal_email_section(
         lines.append("结论: 今日没有触发上涨、下跌或月权墙策略信号。")
         return "\n".join(lines)
 
-    lines.append(f"结论: 检测到 {len(displayed)} 个触发/观察项；仅作研究提示，不自动下单。")
+    actionable = [
+        signal
+        for signal in displayed
+        if signal.status in {"TRIGGERED", "WATCH", "BLOCKED"}
+    ]
+    audit_only = [
+        signal
+        for signal in displayed
+        if signal.status in {"STALE", "MISSED_WINDOW"}
+    ]
+    if actionable:
+        conclusion = f"结论: 检测到 {len(actionable)} 个触发/观察项"
+        if audit_only:
+            conclusion += f"，另有 {len(audit_only)} 个历史审计项"
+        lines.append(conclusion + "；仅作研究提示，不自动下单。")
+    else:
+        lines.append(
+            f"结论: 今日没有可执行新开仓信号；以下 {len(audit_only)} 项"
+            "仅作历史/错过窗口审计，不扫描具体合约。"
+        )
     for index, signal in enumerate(displayed, start=1):
         lines.extend(
             [

@@ -1744,20 +1744,174 @@ class UnifiedLedgerBuilder:
                     price_action = "收取" if leg['position_type'] == 'short' else "支付"
                     self.log_action(f"   * [{leg['leg_role']}] {action} {leg['symbol']} {leg['expiry']} ${leg['strike']}{leg['right_type']} | {price_action}: ${leg['entry_mid']:.2f}")
 
+    @staticmethod
+    def _option_position_key(symbol, expiry, strike, right):
+        expiry_digits = ''.join(character for character in str(expiry) if character.isdigit())[:8]
+        strike_value = UnifiedLedgerBuilder._finite_float(strike)
+        if not symbol or len(expiry_digits) != 8 or strike_value is None or not right:
+            return None
+        return (
+            str(symbol).upper(),
+            expiry_digits,
+            round(float(strike_value), 6),
+            str(right).upper(),
+        )
+
+    @staticmethod
+    def _ledger_signed_quantity(leg):
+        raw_quantity = leg.get('quantity', leg.get('qty', 1))
+        quantity = UnifiedLedgerBuilder._finite_float(raw_quantity)
+        if quantity is None:
+            quantity = 1.0
+        sign = -1.0 if str(leg.get('position_type', '')).lower() == 'short' else 1.0
+        return sign * abs(quantity)
+
+    @staticmethod
+    def _ib_option_cost_per_share(position):
+        contract = position.contract
+        multiplier = UnifiedLedgerBuilder._finite_float(
+            getattr(contract, 'multiplier', None)
+        )
+        if multiplier is None or multiplier <= 0:
+            multiplier = 100.0
+        avg_cost = UnifiedLedgerBuilder._finite_float(
+            getattr(position, 'avgCost', None)
+        )
+        return abs(avg_cost) / multiplier if avg_cost is not None else None
+
+    @staticmethod
+    def _format_option_key(key):
+        symbol, expiry, strike, right = key
+        return f"{symbol} {expiry} ${strike:g}{right}"
+
     def print_current_inventory(self):
-        self.log_action("\n[📊 当前总账本现役兵种一览]")
-        query = self.supabase.table('unified_active_legs').select('*').eq('status', 'ACTIVE').order('created_at', desc=True)
-        res = self.execute_db_with_retry(query, "获取持仓透视")
-        
-        if res and res.data:
-            for leg in res.data:
-                action = "卖出" if leg['position_type'] == 'short' else "买入"
-                real_entry = leg.get('real_entry_price')
-                cost_basis = float(real_entry) if real_entry is not None else float(leg['entry_mid'])
-                tag = "🎯实盘" if real_entry is not None else "📝理论"
-                self.log_action(f"  * {action} [{leg['leg_role']}] | {leg['symbol']} {leg['expiry']} ${leg['strike']}{leg['right_type']} | {tag}建仓价: ${cost_basis:.2f}")
-        else:
-            self.log_action("  ⚪ 统一账本当前为空或获取失败。")
+        snapshot_time = datetime.datetime.now(NY_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
+        self.log_action("\n[📊 IBKR 实际当前持仓（QQQ/TQQQ）]")
+        self.log_action(f"数据源: IBKR positions() 只读快照 | {snapshot_time}")
+
+        ib_positions_available = False
+        relevant_positions = []
+        try:
+            raw_positions = self.ib.positions()
+            ib_positions_available = True
+            relevant_positions = [
+                position
+                for position in raw_positions
+                if self._finite_float(getattr(position, 'position', None)) not in {None, 0.0}
+                and str(getattr(position.contract, 'symbol', '')).upper() in {'QQQ', 'TQQQ'}
+            ]
+        except Exception as exc:
+            self.log_action(f"  [WARN] IBKR实际持仓读取失败: {exc}")
+
+        ib_option_quantities = {}
+        if ib_positions_available and not relevant_positions:
+            self.log_action("  ⚪ IBKR当前没有QQQ/TQQQ非零持仓。")
+        for position in sorted(
+            relevant_positions,
+            key=lambda item: (
+                str(getattr(item.contract, 'symbol', '')),
+                str(getattr(item.contract, 'lastTradeDateOrContractMonth', '')),
+                float(getattr(item.contract, 'strike', 0.0) or 0.0),
+                str(getattr(item.contract, 'right', '')),
+            ),
+        ):
+            contract = position.contract
+            quantity = float(position.position)
+            side = "多头" if quantity > 0 else "空头"
+            sec_type = str(getattr(contract, 'secType', '')).upper()
+            symbol = str(getattr(contract, 'symbol', '')).upper()
+            if sec_type == 'OPT':
+                expiry = str(getattr(contract, 'lastTradeDateOrContractMonth', ''))[:8]
+                strike = float(getattr(contract, 'strike', 0.0) or 0.0)
+                right = str(getattr(contract, 'right', '')).upper()
+                key = self._option_position_key(symbol, expiry, strike, right)
+                if key is not None:
+                    ib_option_quantities[key] = (
+                        ib_option_quantities.get(key, 0.0) + quantity
+                    )
+                cost = self._ib_option_cost_per_share(position)
+                cost_text = f"${cost:.4f}/股" if cost is not None else "缺失"
+                self.log_action(
+                    f"  * {side} {abs(quantity):g}x {symbol} {expiry} "
+                    f"${strike:g}{right} | IB conId {getattr(contract, 'conId', '缺失')} | "
+                    f"IB平均成本 {cost_text}"
+                )
+            elif sec_type == 'STK':
+                avg_cost = self._finite_float(getattr(position, 'avgCost', None))
+                cost_text = f"${abs(avg_cost):.4f}/股" if avg_cost is not None else "缺失"
+                self.log_action(
+                    f"  * {side} {abs(quantity):g}股 {symbol} | IB平均成本 {cost_text}"
+                )
+            else:
+                self.log_action(
+                    f"  * {side} {abs(quantity):g}x {symbol} {sec_type} | "
+                    f"IB平均成本 {getattr(position, 'avgCost', '缺失')}"
+                )
+
+        self.log_action("\n[🧾 Supabase 理论账本一致性审计]")
+        query = (
+            self.supabase.table('unified_active_legs')
+            .select('*')
+            .in_('status', ['ACTIVE', 'ROLL_REQUESTED'])
+            .order('created_at', desc=True)
+        )
+        res = self.execute_db_with_retry(query, "获取理论账本一致性审计")
+        if res is None:
+            self.log_action("  [WARN] Supabase理论账本读取失败，无法完成一致性审计。")
+            return
+
+        ledger_rows = res.data or []
+        if not ib_positions_available:
+            self.log_action("  [WARN] IB持仓不可用；以下理论账本不得视为当前真实持仓。")
+            for leg in ledger_rows:
+                key = self._option_position_key(
+                    leg.get('symbol'),
+                    leg.get('expiry'),
+                    leg.get('strike'),
+                    leg.get('right_type'),
+                )
+                if key is not None:
+                    self.log_action(
+                        f"  * 未核实 {self._format_option_key(key)} | "
+                        f"账本数量 {self._ledger_signed_quantity(leg):+g} | "
+                        f"状态 {leg.get('status', '缺失')}"
+                    )
+            return
+
+        ledger_quantities = {}
+        for leg in ledger_rows:
+            key = self._option_position_key(
+                leg.get('symbol'),
+                leg.get('expiry'),
+                leg.get('strike'),
+                leg.get('right_type'),
+            )
+            if key is None or key[0] not in {'QQQ', 'TQQQ'}:
+                continue
+            ledger_quantities[key] = (
+                ledger_quantities.get(key, 0.0)
+                + self._ledger_signed_quantity(leg)
+            )
+
+        mismatches = []
+        for key in sorted(set(ledger_quantities) | set(ib_option_quantities)):
+            ledger_quantity = ledger_quantities.get(key, 0.0)
+            ib_quantity = ib_option_quantities.get(key, 0.0)
+            if abs(ledger_quantity - ib_quantity) > 1e-9:
+                mismatches.append((key, ledger_quantity, ib_quantity))
+
+        if not mismatches:
+            self.log_action("  ✅ QQQ/TQQQ期权数量与IBKR实际持仓一致。")
+            return
+        self.log_action(
+            f"  ⚠️ 发现 {len(mismatches)} 个数量差异；IBKR为实际持仓权威源，"
+            "本程序不会自动删除Supabase记录。"
+        )
+        for key, ledger_quantity, ib_quantity in mismatches:
+            self.log_action(
+                f"  * {self._format_option_key(key)} | "
+                f"Supabase {ledger_quantity:+g} / IBKR {ib_quantity:+g}"
+            )
 
     def is_trading_day(self):
         try:

@@ -39,6 +39,9 @@ Pass an explicit deployment path to update another vendored copy:
   rows without this metadata remain `WATCH`.
 - The wall signal is evaluated six NYSE sessions before settlement. T+1 entry
   therefore has five sessions through settlement, matching the frozen study.
+- `MISSED_WINDOW` requires an actual Put/Call Wall break within the 3% distance
+  cap. Merely reaching the five-session point while QQQ remains between both
+  walls is `NO_SIGNAL`. Missed and stale signals never receive contract scans.
 
 QQQ OHLC uses unadjusted Yahoo prices (`auto_adjust=False`) to match the frozen
 price-action definition. The email prints the full completed daily OHLC, gap
@@ -90,6 +93,15 @@ bid/ask and liquidity near the close. Because the current session is unfinished
 at 15:35 ET, its bar is deliberately excluded: the signal date shown in the
 email is the prior completed session, and the current day is its T+1 candidate
 entry day.
+
+## Current-position source
+
+The report's current QQQ/TQQQ holdings come directly from the read-only IBKR
+`positions()` snapshot, including signed quantity, contract identity and IB
+average cost. `unified_active_legs` is no longer presented as current physical
+inventory. It is compared with IBKR as a separate theoretical-ledger audit;
+quantity mismatches are printed explicitly and are not auto-deleted or written
+back to Supabase.
 
 ## Verification
 

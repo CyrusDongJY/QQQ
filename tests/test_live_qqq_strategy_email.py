@@ -207,6 +207,62 @@ class LiveQQQStrategyEmailTests(unittest.TestCase):
         )[2]
         self.assertEqual(boundary.status, "TRIGGERED")
 
+    def test_missed_window_requires_an_actual_wall_break(self):
+        no_break = evaluate_qqq_signals(
+            context(
+                signal_date=date(2026, 8, 14),
+                entry_date=date(2026, 8, 17),
+                prior_close=732.07,
+                open=733.41,
+                high=734.39,
+                low=728.32,
+                close=731.07,
+                put_wall=725.0,
+                call_wall=740.0,
+                wall_expiry=date(2026, 8, 21),
+                wall_data_expiry=date(2026, 8, 18),
+                wall_data_source_date=date(2026, 8, 14),
+                wall_sessions_to_expiry=5,
+            )
+        )[2]
+        self.assertEqual(no_break.status, "NO_SIGNAL")
+
+        missed_break = evaluate_qqq_signals(
+            context(
+                signal_date=date(2026, 8, 14),
+                entry_date=date(2026, 8, 17),
+                prior_close=625.0,
+                open=625.0,
+                close=625.0,
+                high=625.0,
+                wall_sessions_to_expiry=5,
+            )
+        )[2]
+        self.assertEqual(missed_break.status, "MISSED_WINDOW")
+        self.assertIn("不入场", missed_break.entry_rule)
+        self.assertIn("不构建", " ".join(missed_break.legs))
+
+        text = format_signal_email_section(
+            context(
+                prior_close=625.0,
+                open=625.0,
+                close=625.0,
+                high=625.0,
+                wall_sessions_to_expiry=5,
+            ),
+            evaluate_qqq_signals(
+                context(
+                    prior_close=625.0,
+                    open=625.0,
+                    close=625.0,
+                    high=625.0,
+                    wall_sessions_to_expiry=5,
+                )
+            ),
+        )
+        self.assertIn("没有可执行新开仓信号", text)
+        self.assertIn("不扫描具体合约", text)
+
     def test_actionable_signal_is_marked_stale_after_entry_window(self):
         signal = evaluate_qqq_signals(
             context(
