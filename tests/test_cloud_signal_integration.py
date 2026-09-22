@@ -1,6 +1,7 @@
 import datetime
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -175,6 +176,79 @@ class CloudSignalIntegrationTests(unittest.TestCase):
             ),
         )
 
+    def test_frozen_signal_state_round_trip_preserves_ohlc(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        builder.logger = SimpleNamespace(warning=lambda *args: None)
+        core = {
+            "signal_date": datetime.date(2026, 8, 14),
+            "entry_date": datetime.date(2026, 8, 17),
+            "prior_close": 732.07,
+            "open": 733.41,
+            "high": 734.39,
+            "low": 728.32,
+            "close": 731.07,
+        }
+        now = self.module.NY_TZ.localize(
+            datetime.datetime(2026, 8, 14, 16, 12)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            builder.qqq_signal_state_path = str(
+                Path(directory) / "qqq_frozen_signal.json"
+            )
+            payload = builder._write_qqq_signal_state(core, now)
+            loaded = builder._read_qqq_signal_state()
+
+        self.assertEqual(payload["signal_id"], "qqq-frozen-v1:2026-08-14:2026-08-17")
+        self.assertEqual(loaded, core)
+
+    def test_premarket_reuses_matching_frozen_signal(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        frozen = {
+            "signal_date": datetime.date(2026, 8, 14),
+            "entry_date": datetime.date(2026, 8, 17),
+            "prior_close": 732.07,
+            "open": 733.41,
+            "high": 734.39,
+            "low": 728.32,
+            "close": 731.07,
+        }
+        builder._read_qqq_signal_state = lambda: frozen
+        builder._build_qqq_signal_core_from_bars = lambda now: self.fail(
+            "matching frozen state must not be recomputed"
+        )
+        now = self.module.NY_TZ.localize(
+            datetime.datetime(2026, 8, 17, 8, 45)
+        )
+
+        loaded, source = builder._load_qqq_signal_core("pre_market", now)
+
+        self.assertIs(loaded, frozen)
+        self.assertIn("持久化冻结状态", source)
+
+    def test_postclose_wait_uses_close_plus_ten_minutes(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        builder.logger = SimpleNamespace(info=lambda *args: None)
+        builder._session_market_close = lambda session_date: self.module.NY_TZ.localize(
+            datetime.datetime(2026, 8, 14, 16, 0)
+        )
+        sleeps = []
+        now = self.module.NY_TZ.localize(
+            datetime.datetime(2026, 8, 14, 16, 7)
+        )
+
+        waited = builder.wait_for_qqq_publication_cutoff(
+            now=now, sleep_fn=sleeps.append
+        )
+
+        self.assertEqual(waited, 181.0)
+        self.assertEqual(sleeps, [181.0])
+
     def test_wall_expiry_requires_explicit_matching_metadata(self):
         extract = self.builder._extract_wall_expiry
         self.assertEqual(
@@ -260,6 +334,72 @@ class CloudSignalIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             calls[:4], ["scan", "connect", "scan_contracts", "reconcile"]
+        )
+
+    def test_open_scan_skips_email_and_broker_when_no_signal_is_active(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        calls = []
+        builder.action_logs = []
+        builder.qqq_strategy_signals = ()
+        builder.is_trading_day = lambda: True
+
+        def scan(stage):
+            calls.append(("scan", stage))
+            builder.qqq_strategy_signals = (
+                SimpleNamespace(status="NO_SIGNAL"),
+            )
+            return "no signal"
+
+        builder.scan_qqq_research_signals = scan
+        builder.connect = lambda: calls.append("connect")
+        builder.log_action = lambda message: builder.action_logs.append(message)
+        builder.send_report = lambda subject, body: calls.append("send_report")
+        builder.disconnect = lambda: calls.append("disconnect")
+
+        builder.run_qqq_live_scan()
+
+        self.assertEqual(calls, [("scan", "live_open"), "disconnect"])
+        self.assertIn("不发送重复邮件", "\n".join(builder.action_logs))
+
+    def test_open_scan_never_runs_builder_maintenance(self):
+        builder = self.module.UnifiedLedgerBuilder.__new__(
+            self.module.UnifiedLedgerBuilder
+        )
+        calls = []
+        builder.action_logs = []
+        builder.qqq_strategy_signals = ()
+        builder.is_trading_day = lambda: True
+
+        def scan(stage):
+            calls.append(("scan", stage))
+            builder.qqq_strategy_signals = (
+                SimpleNamespace(status="TRIGGERED"),
+            )
+            return "triggered"
+
+        builder.scan_qqq_research_signals = scan
+        builder.connect = lambda: calls.append("connect")
+        builder.scan_qqq_option_contract_candidates = lambda: calls.append(
+            "scan_contracts"
+        )
+        builder.send_report = lambda subject, body: calls.append("send_report")
+        builder.disconnect = lambda: calls.append("disconnect")
+        builder.execute_maintenance = lambda: calls.append("maintenance")
+        builder.execute_laddering = lambda: calls.append("laddering")
+
+        builder.run_qqq_live_scan()
+
+        self.assertEqual(
+            calls,
+            [
+                ("scan", "live_open"),
+                "connect",
+                "scan_contracts",
+                "send_report",
+                "disconnect",
+            ],
         )
 
     def test_candidate_strike_sampling_covers_spot_and_protective_wing(self):

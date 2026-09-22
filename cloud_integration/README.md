@@ -87,12 +87,26 @@ above spot so the budget-constrained OTM call is not accidentally omitted. Tune
 `QQQ_FUNDED_CALL_CENTER_MULTIPLIERS` and `QQQ_FUNDED_CALL_COUNT_PER_CENTER`
 in the cloud config if quote load or OTM coverage needs adjustment.
 
-The 15:35 ET scan is a candidate snapshot, not a locked EOD fill and never
-creates an IBKR order. The email instructs the operator to recheck Delta,
-bid/ask and liquidity near the close. Because the current session is unfinished
-at 15:35 ET, its bar is deliberately excluded: the signal date shown in the
-email is the prior completed session, and the current day is its T+1 candidate
-entry day.
+The staged live schedule keeps the frozen `T+1 EOD` research rule unchanged:
+
+- the existing post-close report calls `--mode qqq-section --stage post_close
+  --wait-until-ready` after its normal collection and freezes unadjusted OHLC
+  no earlier than the actual NYSE close plus ten minutes;
+- the existing pre-market report calls `--mode qqq-section --stage pre_market`
+  after writing the current wall snapshot, then reviews that same frozen signal;
+- at 09:35 ET, `--mode qqq-live-scan` obtains the first executable IBKR option
+  snapshot and sends mail only for an active signal or a scan failure;
+- the original 15:35 ET full builder remains the EOD refresh and continues all
+  existing reconciliation, maintenance, laddering and inventory work.
+
+The 09:35 and 15:35 scans are candidate snapshots, not locked fills, and never
+create an IBKR order. The email instructs the operator to recheck Delta,
+bid/ask and liquidity near execution. All stages share the atomically written
+`~/TradingRadar/state/qqq_frozen_signal.json` record (override with
+`QQQ_SIGNAL_STATE_PATH`) and print the same signal ID. If that state is missing
+or does not match the T+1 date, the scanner reconstructs it from completed bars
+and labels the fallback instead of silently presenting it as the persisted
+post-close snapshot.
 
 ## Current-position source
 

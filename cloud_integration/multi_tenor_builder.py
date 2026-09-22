@@ -1,5 +1,7 @@
+import argparse
 import sys
 import os
+import json
 import math
 import time
 import datetime
@@ -50,6 +52,14 @@ NY_TZ = pytz.timezone('America/New_York')
 ACCOUNT_BASE = 100000.0  
 MARGIN_LIMIT_PCT = 0.40  
 COOLDOWN_DAYS = 3        
+
+QQQ_SIGNAL_STATE_VERSION = 1
+QQQ_SIGNAL_STAGES = {
+    'post_close': '盘后冻结',
+    'pre_market': '盘前复核',
+    'live_open': '开盘后可执行报价',
+    'eod_final': 'EOD终检',
+}
 
 @dataclass
 class OptionLeg:
@@ -128,6 +138,15 @@ class UnifiedLedgerBuilder:
         self.action_logs = []
         self.qqq_signal_context = None
         self.qqq_strategy_signals = ()
+        self.qqq_signal_source = None
+        self.qqq_signal_id = None
+        self.qqq_signal_state_path = os.path.expanduser(
+            getattr(
+                cfg,
+                'QQQ_SIGNAL_STATE_PATH',
+                '~/TradingRadar/state/qqq_frozen_signal.json',
+            )
+        )
         
         self.setup_logging()
         self.supabase = self._init_supabase()
@@ -710,6 +729,128 @@ class UnifiedLedgerBuilder:
             raise RuntimeError("QQQ已完成日线不足两天，无法计算信号")
         return bars.tail(2)
 
+    def wait_for_qqq_publication_cutoff(self, now=None, sleep_fn=time.sleep):
+        """Wait only when the post-close parent reaches us before close + 10m."""
+        now = now or datetime.datetime.now(NY_TZ)
+        market_close = self._session_market_close(now.date())
+        if market_close is None:
+            return 0.0
+        cutoff = market_close + datetime.timedelta(minutes=10)
+        wait_seconds = (cutoff - now).total_seconds()
+        if wait_seconds <= 0:
+            return 0.0
+        if wait_seconds > 15 * 60:
+            raise RuntimeError(
+                f"当前时间早于QQQ盘后冻结窗口，需等待{wait_seconds / 60:.1f}分钟"
+            )
+        self.logger.info(
+            "QQQ盘后冻结等待已完成日线发布窗口: %.1f秒", wait_seconds
+        )
+        sleep_fn(wait_seconds + 1.0)
+        return wait_seconds + 1.0
+
+    def _qqq_state_path(self):
+        return os.path.expanduser(
+            getattr(
+                self,
+                'qqq_signal_state_path',
+                '~/TradingRadar/state/qqq_frozen_signal.json',
+            )
+        )
+
+    @staticmethod
+    def _qqq_signal_identifier(signal_date, entry_date):
+        return f"qqq-frozen-v1:{signal_date.isoformat()}:{entry_date.isoformat()}"
+
+    def _write_qqq_signal_state(self, core, now):
+        state_path = self._qqq_state_path()
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        payload = {
+            'version': QQQ_SIGNAL_STATE_VERSION,
+            'signal_id': self._qqq_signal_identifier(
+                core['signal_date'], core['entry_date']
+            ),
+            'frozen_at': now.isoformat(),
+            'signal_date': core['signal_date'].isoformat(),
+            'entry_date': core['entry_date'].isoformat(),
+            'prior_close': core['prior_close'],
+            'open': core['open'],
+            'high': core['high'],
+            'low': core['low'],
+            'close': core['close'],
+        }
+        temporary_path = f"{state_path}.{os.getpid()}.tmp"
+        try:
+            with open(temporary_path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, state_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        return payload
+
+    def _read_qqq_signal_state(self):
+        state_path = self._qqq_state_path()
+        try:
+            with open(state_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError) as exc:
+            self.logger.warning("QQQ冻结信号状态读取失败: %s", exc)
+            return None
+        if payload.get('version') != QQQ_SIGNAL_STATE_VERSION:
+            return None
+        try:
+            core = {
+                'signal_date': datetime.date.fromisoformat(payload['signal_date']),
+                'entry_date': datetime.date.fromisoformat(payload['entry_date']),
+                'prior_close': float(payload['prior_close']),
+                'open': float(payload['open']),
+                'high': float(payload['high']),
+                'low': float(payload['low']),
+                'close': float(payload['close']),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not all(
+            self._finite_float(core[key]) is not None and core[key] > 0
+            for key in ('prior_close', 'open', 'high', 'low', 'close')
+        ):
+            return None
+        return core
+
+    def _build_qqq_signal_core_from_bars(self, now):
+        bars = self._load_completed_qqq_bars(now=now)
+        previous_bar = bars.iloc[-2]
+        signal_bar = bars.iloc[-1]
+        signal_date = bars.index[-1]
+        return {
+            'signal_date': signal_date,
+            'entry_date': self._next_market_day(signal_date),
+            'prior_close': float(previous_bar['Close']),
+            'open': float(signal_bar['Open']),
+            'high': float(signal_bar['High']),
+            'low': float(signal_bar['Low']),
+            'close': float(signal_bar['Close']),
+        }
+
+    def _load_qqq_signal_core(self, stage, now):
+        if stage == 'post_close':
+            core = self._build_qqq_signal_core_from_bars(now)
+            self._write_qqq_signal_state(core, now)
+            return core, '盘后已完成日线（已冻结）'
+
+        frozen = self._read_qqq_signal_state()
+        if frozen is not None and frozen['entry_date'] == now.date():
+            return frozen, '盘后持久化冻结状态'
+
+        core = self._build_qqq_signal_core_from_bars(now)
+        self._write_qqq_signal_state(core, now)
+        return core, '冻结状态缺失或日期不匹配；按已完成日线重建并标记回退'
+
     @staticmethod
     def _next_market_day(signal_date, calendar=None):
         nyse = calendar or mcal.get_calendar('NYSE')
@@ -1182,61 +1323,86 @@ class UnifiedLedgerBuilder:
         notes.append(f"{label} 最终采用{selected_type}行情结果。")
         return selected_quotes, expiry, tuple(notes)
 
-    def scan_qqq_research_signals(self):
+    def prepare_qqq_research_signal_section(self, stage='eod_final', now=None):
+        if stage not in QQQ_SIGNAL_STAGES:
+            raise ValueError(f"未知QQQ信号阶段: {stage}")
+        now = now or datetime.datetime.now(NY_TZ)
+        core, signal_source = self._load_qqq_signal_core(stage, now)
+        signal_date = core['signal_date']
+        entry_date = core['entry_date']
+        wall_expiry, wall_sessions = self._next_standard_monthly_expiry_window(
+            signal_date
+        )
+
+        signal_row = self.load_qqq_post_close_context(signal_date) or {}
+        wall_row = {}
+        if stage != 'post_close':
+            wall_row = self.load_qqq_monthly_wall_context(entry_date) or {}
+
+        context = QQQSignalContext(
+            signal_date=signal_date,
+            entry_date=entry_date,
+            prior_close=core['prior_close'],
+            open=core['open'],
+            high=core['high'],
+            low=core['low'],
+            close=core['close'],
+            put_wall=self._finite_float(wall_row.get('monthly_put_wall')),
+            call_wall=self._finite_float(wall_row.get('monthly_call_wall')),
+            wall_expiry=wall_expiry,
+            wall_data_expiry=self._extract_wall_expiry(wall_row),
+            wall_data_source_date=self._extract_wall_source_date(wall_row),
+            wall_sessions_to_expiry=wall_sessions,
+            five_factor_regime=self._extract_five_factor_regime(signal_row),
+            iv_rank=self._finite_float(
+                signal_row.get('iv_rank_pct', signal_row.get('ivr_pct'))
+            ),
+            skew_25d=None,
+            entry_stale_reason=self._entry_stale_reason(entry_date, now=now),
+        )
+        signals = evaluate_qqq_signals(context)
+        self.qqq_signal_context = context
+        self.qqq_strategy_signals = signals
+        self.qqq_signal_source = signal_source
+        self.qqq_signal_id = self._qqq_signal_identifier(signal_date, entry_date)
+
+        section_lines = format_signal_email_section(context, signals).splitlines()
+        stage_lines = [
+            (
+                f"运行阶段: {QQQ_SIGNAL_STAGES[stage]} | "
+                f"信号ID: {self.qqq_signal_id}"
+            ),
+            f"冻结数据源: {signal_source}",
+        ]
+        if not signal_row:
+            stage_lines.append(
+                f"数据状态: {signal_date.isoformat()}缺少stock_spot_post_close；"
+                "五因子gate按缺失处理。"
+            )
+        if stage == 'post_close':
+            stage_lines.append(
+                "阶段说明: 本阶段只冻结收盘价格信号；标准月权墙将在T+1盘前数据落库后复核。"
+            )
+        elif not wall_row:
+            stage_lines.append(
+                f"数据状态: {entry_date.isoformat()}缺少stock_options_pre_market；"
+                "标准月权墙按缺失处理。"
+            )
+        insert_at = 2 if section_lines and section_lines[0] == '' else 1
+        section_lines[insert_at:insert_at] = stage_lines
+        return "\n".join(section_lines)
+
+    def scan_qqq_research_signals(self, stage='eod_final'):
         self.log_action("\n[QQQ 冻结策略信号扫描]")
         try:
-            now = datetime.datetime.now(NY_TZ)
-            bars = self._load_completed_qqq_bars(now=now)
-            previous_bar = bars.iloc[-2]
-            signal_bar = bars.iloc[-1]
-            signal_date = bars.index[-1]
-            entry_date = self._next_market_day(signal_date)
-            wall_expiry, wall_sessions = self._next_standard_monthly_expiry_window(signal_date)
-
-            signal_row = self.load_qqq_post_close_context(signal_date)
-            if signal_row is None:
-                self.log_action(
-                    f"  [WARN] {signal_date.isoformat()}缺少stock_spot_post_close记录；"
-                    "五因子gate按缺失处理。"
-                )
-                signal_row = {}
-            wall_row = self.load_qqq_monthly_wall_context(entry_date)
-            if wall_row is None:
-                self.log_action(
-                    f"  [WARN] {entry_date.isoformat()}缺少stock_options_pre_market记录；"
-                    "标准月权墙按缺失处理。"
-                )
-                wall_row = {}
-
-            context = QQQSignalContext(
-                signal_date=signal_date,
-                entry_date=entry_date,
-                prior_close=float(previous_bar['Close']),
-                open=float(signal_bar['Open']),
-                high=float(signal_bar['High']),
-                low=float(signal_bar['Low']),
-                close=float(signal_bar['Close']),
-                put_wall=self._finite_float(wall_row.get('monthly_put_wall')),
-                call_wall=self._finite_float(wall_row.get('monthly_call_wall')),
-                wall_expiry=wall_expiry,
-                wall_data_expiry=self._extract_wall_expiry(wall_row),
-                wall_data_source_date=self._extract_wall_source_date(wall_row),
-                wall_sessions_to_expiry=wall_sessions,
-                five_factor_regime=self._extract_five_factor_regime(signal_row),
-                iv_rank=self._finite_float(
-                    signal_row.get('iv_rank_pct', signal_row.get('ivr_pct'))),
-                skew_25d=None,
-                entry_stale_reason=self._entry_stale_reason(entry_date, now=now),
-            )
-            signals = evaluate_qqq_signals(context)
-            self.qqq_signal_context = context
-            self.qqq_strategy_signals = signals
-            section = format_signal_email_section(context, signals)
+            section = self.prepare_qqq_research_signal_section(stage=stage)
             for line in section.splitlines():
                 self.log_action(line)
+            return section
         except Exception as exc:
             # 研究信号绝不能影响原有对账、维护和建仓路径。
             self.log_action(f"  [WARN] QQQ研究信号扫描失败，原交易流程继续: {exc}")
+            return None
 
     def scan_qqq_option_contract_candidates(self):
         """Enrich current QQQ signals with read-only IBKR option candidates."""
@@ -1963,6 +2129,79 @@ class UnifiedLedgerBuilder:
             
             self.disconnect()
 
-if __name__ == "__main__":
-    builder = UnifiedLedgerBuilder(port=4001, client_id=889) 
+    def run_qqq_live_scan(self):
+        """Run only the T+1 open quote scan; never run maintenance or laddering."""
+        if not self.is_trading_day():
+            self.log_action("🛑 今天是美股休市日，QQQ开盘报价扫描静默退出。")
+            return
+        should_email = False
+        try:
+            section = self.scan_qqq_research_signals(stage='live_open')
+            if section is None:
+                should_email = True
+                return
+            active = [
+                signal
+                for signal in self.qqq_strategy_signals
+                if signal.status in {'TRIGGERED', 'WATCH', 'BLOCKED'}
+            ]
+            if not active:
+                self.log_action(
+                    "[*] 当前没有需要开盘后获取IBKR报价的QQQ冻结信号；不发送重复邮件。"
+                )
+                return
+            should_email = True
+            try:
+                self.connect()
+            except Exception as exc:
+                self.log_action(
+                    f"  [WARN] IBKR连接失败，仍输出QQQ逐策略合约扫描失败原因: {exc}"
+                )
+            self.scan_qqq_option_contract_candidates()
+        except Exception as exc:
+            should_email = True
+            self.log_action(
+                f"\n[X] QQQ开盘后可执行报价扫描失败: {exc}\n{traceback.format_exc()}"
+            )
+        finally:
+            if should_email:
+                date_str = datetime.datetime.now(NY_TZ).strftime('%Y-%m-%d %H:%M')
+                self.send_report(
+                    f"[可执行报价] QQQ冻结策略 ({date_str})",
+                    "\n".join(self.action_logs),
+                )
+            self.disconnect()
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description='QQQ账本与冻结策略调度入口')
+    parser.add_argument(
+        '--mode',
+        choices=('full', 'qqq-section', 'qqq-live-scan'),
+        default='full',
+    )
+    parser.add_argument(
+        '--stage',
+        choices=tuple(QQQ_SIGNAL_STAGES),
+        default='eod_final',
+    )
+    parser.add_argument('--wait-until-ready', action='store_true')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    builder = UnifiedLedgerBuilder(port=4001, client_id=889)
+    if args.mode == 'qqq-section':
+        if args.stage == 'post_close' and args.wait_until_ready:
+            builder.wait_for_qqq_publication_cutoff()
+        print(builder.prepare_qqq_research_signal_section(stage=args.stage))
+        return
+    if args.mode == 'qqq-live-scan':
+        builder.run_qqq_live_scan()
+        return
     builder.run()
+
+
+if __name__ == "__main__":
+    main()
