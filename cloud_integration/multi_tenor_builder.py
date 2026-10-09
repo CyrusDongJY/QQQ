@@ -45,13 +45,16 @@ except ImportError:
     print("❌ 致命错误：找不到 market_config.py 密钥文件！")
     sys.exit(1)
 
-logging.getLogger('ib_insync').setLevel(logging.CRITICAL)
+logging.getLogger('ib_insync').setLevel(logging.ERROR)
 
 # ================= 资金与时区配置 =================
 NY_TZ = pytz.timezone('America/New_York') 
 ACCOUNT_BASE = 100000.0  
 MARGIN_LIMIT_PCT = 0.40  
 COOLDOWN_DAYS = 3        
+IB_CONNECT_TIMEOUT = 20.0
+IB_CONNECT_ATTEMPTS = 3
+IB_CONNECT_RETRY_DELAY = 3
 
 QQQ_SIGNAL_STATE_VERSION = 1
 QQQ_SIGNAL_STAGES = {
@@ -177,17 +180,36 @@ class UnifiedLedgerBuilder:
         self.logger.info(msg)
 
     def send_report(self, subject, body):
-        msg = MIMEText(body, 'plain', 'utf-8')
-        msg['From'] = cfg.SENDER_EMAIL
-        msg['To'] = cfg.QQ_RECEIVER_EMAIL
-        msg['Subject'] = Header(subject, 'utf-8')
+        server = None
         try:
+            msg = MIMEText(body, 'plain', 'utf-8')
+            msg['From'] = cfg.SENDER_EMAIL
+            msg['To'] = cfg.QQ_RECEIVER_EMAIL
+            msg['Subject'] = Header(subject, 'utf-8')
             server = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=10)
             server.login(cfg.SENDER_EMAIL, cfg.APP_PASSWORD)
-            server.sendmail(cfg.SENDER_EMAIL, [cfg.QQ_RECEIVER_EMAIL], msg.as_string())
-            server.quit()
-        except Exception as e:
-            self.logger.error(f"❌ 邮件发送失败: {e}")
+            refused = server.sendmail(
+                cfg.SENDER_EMAIL, [cfg.QQ_RECEIVER_EMAIL], msg.as_string())
+            if refused:
+                self.logger.error('邮件收件人被SMTP拒绝: %s', list(refused))
+                return False
+            self.logger.info('邮件已获SMTP接受: %s', subject)
+            return True
+        except Exception as exc:
+            self.logger.exception(
+                '邮件发送失败: %s: %r', type(exc).__name__, exc)
+            return False
+        finally:
+            if server is not None:
+                # SMTP接受邮件后，QUIT失败不应改变发送结果或触发重复发信。
+                try:
+                    server.quit()
+                except Exception:
+                    self.logger.warning('SMTP会话清理失败', exc_info=True)
+                    try:
+                        server.close()
+                    except Exception:
+                        self.logger.warning('SMTP连接关闭失败', exc_info=True)
 
     def execute_db_with_retry(self, query, action_name, max_retries=3):
         for attempt in range(max_retries):
@@ -202,9 +224,37 @@ class UnifiedLedgerBuilder:
         return None
 
     def connect(self):
-        self.log_action(f"[*] 执行中枢连接 IBKR...")
-        self.ib.connect(self.host, self.port, clientId=self.client_id, readonly=True)
-        self.ib.reqMarketDataType(1)
+        for attempt in range(1, IB_CONNECT_ATTEMPTS + 1):
+            self.log_action(
+                f'[*] 执行中枢连接 IBKR（第{attempt}/{IB_CONNECT_ATTEMPTS}次，'
+                f'初始化请求超时{IB_CONNECT_TIMEOUT:g}秒）...')
+            started = time.monotonic()
+            try:
+                self.ib.connect(
+                    self.host, self.port, clientId=self.client_id,
+                    readonly=True, timeout=IB_CONNECT_TIMEOUT)
+                if not self.ib.isConnected():
+                    raise ConnectionError('IBKR初始化后连接不可用')
+                self.ib.reqMarketDataType(1)
+                self.log_action(
+                    f'[*] IBKR连接完成，耗时{time.monotonic() - started:.2f}秒。')
+                return
+            except Exception as exc:
+                self.log_action(
+                    f'  [WARN] IBKR连接/初始化失败（第{attempt}次，'
+                    f'耗时{time.monotonic() - started:.2f}秒）: '
+                    f'{type(exc).__name__}: {exc!r}')
+                self.logger.exception('IBKR初始化异常堆栈')
+                try:
+                    self.ib.disconnect()
+                except Exception:
+                    self.logger.exception('IBKR失败连接清理异常，停止重试')
+                    raise
+                if attempt == IB_CONNECT_ATTEMPTS:
+                    raise
+                delay = IB_CONNECT_RETRY_DELAY * attempt
+                self.log_action(f'[*] {delay}秒后重新连接IBKR。')
+                time.sleep(delay)
 
     def disconnect(self):
         if self.ib.isConnected(): self.ib.disconnect()
@@ -2093,6 +2143,7 @@ class UnifiedLedgerBuilder:
         if not self.is_trading_day():
             self.log_action("🛑 今天是美股休市日，总司令进入法定休眠。")
             return
+        run_ok = True
         try:
             # This scanner does not depend on IBKR and should still report if
             # the broker connection later fails.
@@ -2101,7 +2152,8 @@ class UnifiedLedgerBuilder:
                 self.connect()
             except Exception as exc:
                 self.log_action(
-                    f"  [WARN] IBKR连接失败，仍输出QQQ逐策略合约扫描失败原因: {exc}"
+                    '  [WARN] IBKR连接未恢复，仍输出QQQ逐策略合约扫描失败原因: '
+                    f'{type(exc).__name__}: {exc!r}'
                 )
                 self.scan_qqq_option_contract_candidates()
                 raise
@@ -2113,8 +2165,10 @@ class UnifiedLedgerBuilder:
             self.execute_laddering()
             self.print_current_inventory()
         except Exception as e:
+            run_ok = False
             err_msg = traceback.format_exc()
-            self.log_action(f"\n[X] 运行发生致命错误: {e}\n{err_msg}")
+            self.log_action(
+                f'\n[X] 运行发生致命错误: {type(e).__name__}: {e!r}\n{err_msg}')
         finally:
             try:
                 date_str = datetime.datetime.now(NY_TZ).strftime('%Y-%m-%d %H:%M')
@@ -2123,11 +2177,17 @@ class UnifiedLedgerBuilder:
                 if any("[X] 运行发生致命错误" in log for log in self.action_logs):
                     subject = "🔴 崩溃警报 | " + subject
                     
-                self.send_report(subject, "\n".join(self.action_logs))
+                if not self.send_report(subject, "\n".join(self.action_logs)):
+                    run_ok = False
             except Exception as e2:
-                self.logger.error(f"最终发送邮件也失败了: {e2}")
-            
-            self.disconnect()
+                run_ok = False
+                self.logger.exception('最终发送邮件也失败了: %r', e2)
+            try:
+                self.disconnect()
+            except Exception:
+                run_ok = False
+                self.logger.exception('Builder连接清理失败')
+        return run_ok
 
     def run_qqq_live_scan(self):
         """Run only the T+1 open quote scan; never run maintenance or laddering."""
@@ -2135,42 +2195,58 @@ class UnifiedLedgerBuilder:
             self.log_action("🛑 今天是美股休市日，QQQ开盘报价扫描静默退出。")
             return
         should_email = False
+        run_ok = True
         try:
             section = self.scan_qqq_research_signals(stage='live_open')
             if section is None:
                 should_email = True
-                return
-            active = [
-                signal
-                for signal in self.qqq_strategy_signals
-                if signal.status in {'TRIGGERED', 'WATCH', 'BLOCKED'}
-            ]
-            if not active:
-                self.log_action(
-                    "[*] 当前没有需要开盘后获取IBKR报价的QQQ冻结信号；不发送重复邮件。"
-                )
-                return
-            should_email = True
-            try:
-                self.connect()
-            except Exception as exc:
-                self.log_action(
-                    f"  [WARN] IBKR连接失败，仍输出QQQ逐策略合约扫描失败原因: {exc}"
-                )
-            self.scan_qqq_option_contract_candidates()
+                run_ok = False
+            else:
+                active = [
+                    signal
+                    for signal in self.qqq_strategy_signals
+                    if signal.status in {'TRIGGERED', 'WATCH', 'BLOCKED'}
+                ]
+                if not active:
+                    self.log_action(
+                        "[*] 当前没有需要开盘后获取IBKR报价的QQQ冻结信号；不发送重复邮件。"
+                    )
+                else:
+                    should_email = True
+                    try:
+                        self.connect()
+                    except Exception as exc:
+                        run_ok = False
+                        self.log_action(
+                            '  [WARN] IBKR连接未恢复，仍输出QQQ逐策略合约扫描失败原因: '
+                            f'{type(exc).__name__}: {exc!r}'
+                        )
+                    self.scan_qqq_option_contract_candidates()
         except Exception as exc:
             should_email = True
+            run_ok = False
             self.log_action(
-                f"\n[X] QQQ开盘后可执行报价扫描失败: {exc}\n{traceback.format_exc()}"
+                f'\n[X] QQQ开盘后可执行报价扫描失败: '
+                f'{type(exc).__name__}: {exc!r}\n{traceback.format_exc()}'
             )
         finally:
-            if should_email:
-                date_str = datetime.datetime.now(NY_TZ).strftime('%Y-%m-%d %H:%M')
-                self.send_report(
-                    f"[可执行报价] QQQ冻结策略 ({date_str})",
-                    "\n".join(self.action_logs),
-                )
-            self.disconnect()
+            try:
+                if should_email:
+                    date_str = datetime.datetime.now(NY_TZ).strftime('%Y-%m-%d %H:%M')
+                    if not self.send_report(
+                            f"[可执行报价] QQQ冻结策略 ({date_str})",
+                            "\n".join(self.action_logs)):
+                        run_ok = False
+            except Exception:
+                run_ok = False
+                self.logger.exception('QQQ开盘报告发送异常')
+            finally:
+                try:
+                    self.disconnect()
+                except Exception:
+                    run_ok = False
+                    self.logger.exception('QQQ开盘扫描连接清理失败')
+        return run_ok
 
 
 def parse_args(argv=None):
@@ -2196,12 +2272,11 @@ def main(argv=None):
         if args.stage == 'post_close' and args.wait_until_ready:
             builder.wait_for_qqq_publication_cutoff()
         print(builder.prepare_qqq_research_signal_section(stage=args.stage))
-        return
+        return 0
     if args.mode == 'qqq-live-scan':
-        builder.run_qqq_live_scan()
-        return
-    builder.run()
+        return 1 if builder.run_qqq_live_scan() is False else 0
+    return 1 if builder.run() is False else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

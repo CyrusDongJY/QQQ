@@ -117,6 +117,22 @@ inventory. It is compared with IBKR as a separate theoretical-ledger audit;
 quantity mismatches are printed explicitly and are not auto-deleted or written
 back to Supabase.
 
+## Connection and delivery failures
+
+Both the full builder and the 09:35 scan use a read-only IBKR connection with
+a 20-second timeout for initialization requests, including execution-history
+synchronization. Connection failures are retried up to three attempts with
+3- and 6-second pauses and a disconnect between attempts. If cleanup fails,
+the builder stops retrying. Reconciliation, maintenance and laddering run only
+after connection succeeds.
+
+Connection failures record their exception type even when the exception message
+is empty. The full traceback and IBKR error-level messages remain in the logs.
+Exhausted retries still produce the existing failure report. SMTP acceptance
+and rejection are logged explicitly; SMTP acceptance does not confirm inbox
+delivery. Fatal runs and email failures return exit status 1. A trading-day
+skip or a 09:35 scan without an active signal still exits quietly with status 0.
+
 ## Verification
 
 ```bash
