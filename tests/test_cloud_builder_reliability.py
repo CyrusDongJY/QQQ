@@ -6,6 +6,23 @@ from unittest.mock import MagicMock, call, patch
 from test_cloud_signal_integration import load_cloud_builder_module
 
 
+class ErrorEvent:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self.handlers.remove(handler)
+        return self
+
+    def emit(self, code, message):
+        for handler in list(self.handlers):
+            handler(-1, code, message, None)
+
+
 class BuilderReliabilityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -82,6 +99,30 @@ class BuilderReliabilityTests(unittest.TestCase):
         logger = logging.getLogger('ib_insync')
         self.assertTrue(logger.isEnabledFor(logging.ERROR))
         self.assertFalse(logger.isEnabledFor(logging.INFO))
+
+    def test_backend_disconnect_is_reported_once_across_retries(self):
+        event = self.builder.ib.errorEvent = ErrorEvent()
+
+        def fail_sync(*_args, **_kwargs):
+            event.emit(2104, 'Market data farm connection is OK:usfarm')
+            event.emit(2110, 'Connectivity between Trader Workstation and server is broken.')
+            raise TimeoutError()
+
+        self.builder.ib.connect.side_effect = fail_sync
+        with patch.object(self.module.time, 'sleep'):
+            with self.assertRaises(TimeoutError):
+                self.builder.connect()
+        report = '\n'.join(self.builder.action_logs)
+        self.assertEqual(report.count('[IBKR连接状态] 2110'), 1)
+        self.assertNotIn('[IBKR连接状态] 2104', report)
+        self.assertEqual(event.handlers, [])
+
+    def test_connection_listener_is_removed_after_success(self):
+        event = self.builder.ib.errorEvent = ErrorEvent()
+        self.builder.connect()
+        self.assertEqual(event.handlers, [])
+        event.emit(2110, 'late unrelated event')
+        self.assertNotIn('late unrelated event', '\n'.join(self.builder.action_logs))
 
     def test_full_run_recovers_before_running_each_business_stage_once(self):
         self.mock_workflow()

@@ -224,11 +224,25 @@ class UnifiedLedgerBuilder:
         return None
 
     def connect(self):
+        connection_errors = []
+        ignored_error_codes = {2104, 2106, 2107, 2108, 2119, 2158}
+
+        def on_error(req_id, error_code, error_string, contract):
+            if error_code in ignored_error_codes:
+                return
+            message = f'{error_code} {str(error_string).strip()}'
+            if message not in connection_errors:
+                connection_errors.append(message)
+                self.log_action(f'  [IBKR连接状态] {message}')
+
+        error_event = getattr(self.ib, 'errorEvent', None)
         for attempt in range(1, IB_CONNECT_ATTEMPTS + 1):
             self.log_action(
                 f'[*] 执行中枢连接 IBKR（第{attempt}/{IB_CONNECT_ATTEMPTS}次，'
                 f'初始化请求超时{IB_CONNECT_TIMEOUT:g}秒）...')
             started = time.monotonic()
+            if error_event is not None:
+                error_event += on_error
             try:
                 self.ib.connect(
                     self.host, self.port, clientId=self.client_id,
@@ -255,6 +269,9 @@ class UnifiedLedgerBuilder:
                 delay = IB_CONNECT_RETRY_DELAY * attempt
                 self.log_action(f'[*] {delay}秒后重新连接IBKR。')
                 time.sleep(delay)
+            finally:
+                if error_event is not None:
+                    error_event -= on_error
 
     def disconnect(self):
         if self.ib.isConnected(): self.ib.disconnect()

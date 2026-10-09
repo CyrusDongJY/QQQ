@@ -128,6 +128,9 @@ after connection succeeds.
 
 Connection failures record their exception type even when the exception message
 is empty. The full traceback and IBKR error-level messages remain in the logs.
+During initialization, actionable IBKR connection events (such as server
+disconnect code 2110) are included once in the report; routine farm-ready
+messages are suppressed. The temporary listener is removed after connection.
 Exhausted retries still produce the existing failure report. SMTP acceptance
 and rejection are logged explicitly; SMTP acceptance does not confirm inbox
 delivery. Fatal runs and email failures return exit status 1. A trading-day
